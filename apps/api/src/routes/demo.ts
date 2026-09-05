@@ -7,12 +7,18 @@ import { requireSeller, type AuthedVariables } from "../middleware/auth";
  * Demo-only routes. Only mounted when STELLAR_NETWORK=testnet so they can
  * never touch real funds on the public network.
  *
+ * GET  /demo/link  — returns the id of a seeded demo link, or null when the
+ *   demo has not been seeded. The /demo page renders its "Pay $25.00" widget
+ *   button from this, so the button either points at a link that exists or
+ *   tells the visitor to run `pnpm demo:seed`. It used to hardcode
+ *   `demo_mug_123`, an id the seed script never creates.
+ *
  * POST /demo/reset — deletes all rows where is_demo = true from the links table
  *   and clears their processed-tx entries so the watcher doesn't stay stuck.
  *
  * The seeding itself does NOT go through a special endpoint: the seed script
  * creates ordinary links (flagged isDemo:true) via the standard POST /links,
- * so this route only needs the reset half.
+ * so this route only needs the read and reset halves.
  *
  * Security: `/reset` wipes rows, so it is gated by requireSeller just like
  * link creation — an unauthenticated caller cannot wipe the demo data on a
@@ -34,6 +40,20 @@ export function demoRoutes(container: Container): Hono<{ Variables: AuthedVariab
     session: container.auth.session,
     sellers: container.sellers,
     revocations: container.auth.revocations,
+  });
+
+  /**
+   * The id of a seeded demo link, for the public /demo page's widget button.
+   *
+   * Deliberately unauthenticated: the page is a server component rendered for
+   * anonymous visitors, and the response carries nothing a payment link does
+   * not already expose to anyone who can open it. It is still testnet-only via
+   * the guard above, and returns only demo-flagged rows — never a real
+   * seller's link.
+   */
+  app.get("/link", async (ctx) => {
+    const link = await container.links.findDemo();
+    return ctx.json({ linkId: link?.id ?? null });
   });
 
   /**

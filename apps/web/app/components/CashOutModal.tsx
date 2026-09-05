@@ -111,6 +111,9 @@ export default function CashOutModal({
   const [quote, setQuote] = useState<QuotePreview | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  // Set only when the anchor asked for an interactive flow and the popup was
+  // blocked — the seller needs a link they can open themselves.
+  const [interactiveUrl, setInteractiveUrl] = useState<string | null>(null);
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // ---- fetch requirements on mount ----------------------------------------
@@ -167,6 +170,43 @@ export default function CashOutModal({
     return out;
   }
 
+  /**
+   * Opens the anchor's SEP-24 interactive flow.
+   *
+   * Two things this deliberately does not do naively:
+   *
+   * `url` is third-party data — it comes from the anchor, through our API, and
+   * lands in a DOM sink. Anything but https is refused: `javascript:` in
+   * `window.open` would execute against this page, and plain http would
+   * downgrade a flow the seller is about to enter bank details into.
+   *
+   * The call also happens after `await api.cashOut(...)`, so it is outside the
+   * click's user-gesture window and browsers routinely block it. A blocked
+   * popup must not silently swallow the URL — the seller would be left on a
+   * link stuck in `offramp_pending` with nothing to act on — so we keep it and
+   * render it as a link they can click themselves.
+   */
+  function openInteractive(url: string): void {
+    let parsed: URL;
+    try {
+      parsed = new URL(url);
+    } catch {
+      setInteractiveUrl(null);
+      setErrorMsg("The anchor returned an unusable interactive URL. Contact support before retrying.");
+      return;
+    }
+    if (parsed.protocol !== "https:") {
+      setInteractiveUrl(null);
+      setErrorMsg("The anchor returned a non-HTTPS interactive URL, which was refused.");
+      return;
+    }
+
+    // `noopener` also keeps the anchor's page from reaching back through
+    // window.opener to navigate this one.
+    const popup = window.open(parsed.href, "_blank", "width=600,height=700,noopener,noreferrer");
+    if (!popup) setInteractiveUrl(parsed.href);
+  }
+
   async function handleSubmit() {
     if (!requirements) return;
     const errs = validate(requirements.descriptors, values, requirements.savedFields);
@@ -178,6 +218,9 @@ export default function CashOutModal({
     setErrorMsg(null);
     try {
       const result = await api.cashOut(linkId, targetCurrency, buildPayoutFields());
+      if (result.interactiveUrl) {
+        openInteractive(result.interactiveUrl);
+      }
       const j = result.job;
       const preview: QuotePreview = {
         jobId: j.jobId,
@@ -402,6 +445,24 @@ export default function CashOutModal({
               Cancel
             </button>
           </form>
+        )}
+
+        {/* The anchor needs the seller in a browser and the popup was blocked —
+            give them the link rather than stranding the withdrawal. */}
+        {interactiveUrl && (
+          <div className="banner banner--warn" style={{ marginTop: 12 }}>
+            <p style={{ margin: "0 0 8px" }}>
+              Your anchor needs one more step in a browser window, which this browser blocked.
+            </p>
+            <a
+              className="btn btn--primary"
+              href={interactiveUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              Continue with the anchor
+            </a>
+          </div>
         )}
 
         {/* Quote confirmation panel (shown after initiate succeeds) */}

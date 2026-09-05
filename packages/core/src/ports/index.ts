@@ -501,11 +501,16 @@ export interface CreateLinkInput {
 }
 
 /** One incoming payment recorded against a link — the authoritative ledger
- *  row cumulative accounting sums over (issue 1.4). `txHash` is unique so a
- *  reprocessed payment can never double-count. */
+ *  row cumulative accounting sums over (issue 1.4). Unique on
+ *  `(txHash, operationId)`, not `txHash` alone (issue 4.11): a transaction
+ *  can carry more than one payment operation to the same link (a split
+ *  payment), and each must be recorded, not dropped as a false duplicate of
+ *  the other. A reprocessed *operation* still never double-counts. */
 export interface LinkPaymentRecord {
   linkId: string;
   txHash: string;
+  /** The chain's per-operation identifier (Horizon's `pagingToken`). */
+  operationId: string;
   payer: string;
   amount: string;
   asset: AssetRef;
@@ -535,8 +540,10 @@ export interface LinkRepository {
   /** Active (or underpaid) links whose value lands in `destination`. */
   openLinksForDestination(destination: string): Promise<PaymentLink[]>;
   save(link: PaymentLink): Promise<void>;
-  /** Append a payment to the link's ledger. A duplicate `txHash` is a no-op —
-   *  cumulative accounting must never double-count a reprocessed payment. */
+  /** Append a payment to the link's ledger. A duplicate `(txHash, operationId)`
+   *  is a no-op — cumulative accounting must never double-count a reprocessed
+   *  operation. Two *different* operations that happen to share a `txHash`
+   *  (a split payment) are two rows, not one (issue 4.11). */
   recordPayment(payment: LinkPaymentRecord): Promise<void>;
   /** Sum of every payment ever recorded for this link, as a decimal string
    *  ("0" if none). The authoritative source `paidAmount` is cached from. */
@@ -642,8 +649,27 @@ export interface WebhookRepository {
   create(input: { sellerId: string; url: string; secret: string }): Promise<Webhook>;
   /** Active (non-deleted) webhooks for a seller. Used for both dispatch and listing. */
   listBySeller(sellerId: string): Promise<Webhook[]>;
+  /** Scoped to the owning seller to prevent cross-tenant access (IDOR). */
+  getById(id: string, sellerId: string, opts?: { includeDeleted?: boolean }): Promise<Webhook | null>;
+  /**
+   * Unscoped lookup by id. Only for the delivery worker, which runs outside any
+   * request and therefore has no seller context; never reachable from a route.
+   */
   findWebhookById(id: string): Promise<Webhook | null>;
-  recordDelivery(d: WebhookDelivery): Promise<void>;
+  /**
+   * Rotates the signing secret. The previous secret remains valid for
+   * `overlapMs` so in-flight receivers can be redeployed without dropping
+   * events (see WebhookSender, which signs with both during the overlap).
+   */
+  rotateSecret(id: string, sellerId: string, newSecret: string, overlapMs: number): Promise<Webhook | null>;
+  /** Soft delete — keeps delivery history browsable after removal. */
+  softDelete(id: string, sellerId: string): Promise<boolean>;
+  recordDelivery(d: Omit<WebhookDelivery, "id" | "createdAt">): Promise<void>;
+  listDeliveries(
+    webhookId: string,
+    sellerId: string,
+    opts: { limit: number; cursor?: string | null },
+  ): Promise<{ deliveries: WebhookDelivery[]; nextCursor: string | null }>;
 
   // --- Queue operations ---
   /** Insert a new pending queue entry. */
@@ -664,12 +690,22 @@ export interface WebhookRepository {
   listDeliveriesByLinkId(linkId: string): Promise<WebhookDelivery[]>;
 }
 
-/** Watcher bookkeeping: per-account cursor + processed-tx ledger for idempotency. */
+/**
+ * Watcher bookkeeping: per-account cursor + processed-payment ledger for
+ * idempotency.
+ *
+ * Keyed by operation, not transaction (issue 4.11): a Stellar transaction can
+ * carry up to 100 operations, and a payment is one operation, not the whole
+ * transaction. `operationId` is the chain's per-operation identifier (Horizon's
+ * `pagingToken` for Stellar) — two payment operations sharing one `txHash`
+ * (a split payment, or a batch that happens to pay two different watched
+ * destinations) must dedupe independently, not collide on the shared hash.
+ */
 export interface WatcherStateRepository {
   getCursor(account: string): Promise<string | null>;
   setCursor(account: string, cursor: string): Promise<void>;
-  isProcessed(txHash: string): Promise<boolean>;
-  markProcessed(txHash: string, linkId: string | null): Promise<void>;
+  isProcessed(txHash: string, operationId: string): Promise<boolean>;
+  markProcessed(txHash: string, operationId: string, linkId: string | null): Promise<void>;
 }
 
 /** Session-JWT revocation, keyed by the token's own `jti` — logout and
@@ -683,4 +719,25 @@ export interface TokenRevocationRepository {
   /** Deletes revocation rows whose token would already fail verification on
    *  expiry alone — safe to call opportunistically, no correctness impact. */
   sweepExpired(now: number): Promise<void>;
+}
+
+/**
+ * Single-use tracking for SEP-10 challenge transactions, keyed by the
+ * challenge's own tx hash. With more than one API instance, an in-memory
+ * implementation only enforces "used once per process" — the same signed
+ * challenge can be redeemed once on every instance inside its validity
+ * window, minting one session per instance from a single signature. A
+ * Redis-backed implementation (`SET NX` or equivalent) closes that gap by
+ * sharing the claim across instances.
+ */
+export interface UsedChallengeStore {
+  /**
+   * Atomically claims `hash` as used, valid until `expiresAt` (epoch
+   * seconds — the challenge's own timebound, so a claim never outlives the
+   * challenge it guards). Returns `true` when this call is the first to
+   * claim it (redemption proceeds), `false` when it was already claimed
+   * (the caller must reject the redemption). Must not have a check-then-set
+   * race between two concurrent callers claiming the same hash.
+   */
+  claim(hash: string, expiresAt: number): Promise<boolean>;
 }

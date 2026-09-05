@@ -217,12 +217,6 @@ Worth a testnet spike while audits run. Not worth stopping shipping for.
       substring that pubnet does not contain, send leg hardcoded to XLM
       regardless of the asset withdrawn, and a fabricated placeholder job that
       could re-send a payment); the state-durability blocker remains.
-- [ ] **`scripts/demo-seed.ts` / `demo-reset.ts` are testnet-only** — they
-      hardcode `Networks.TESTNET` and friendbot. They also cannot currently
-      resolve `@stellar/stellar-sdk` from the repo root under pnpm's strict
-      `node_modules`, so `pnpm demo:seed` fails. Either move them under
-      `apps/api/scripts/` (as `gen-mainnet-secrets.mjs` was) or add the SDK to
-      the root manifest.
 - [ ] **`db-backup.yml` points at the testnet database.** Repoint before relying
       on it for mainnet.
 - [x] ~~**Dependabot PR #148**~~ — closed 2026-08-22. The repo has no open

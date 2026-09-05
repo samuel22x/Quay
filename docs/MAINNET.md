@@ -8,10 +8,15 @@ therefore mostly configuration, one genuine code decision (which anchor), and a
 set of checks. It is written as a runbook: do the steps in order, and do not
 skip the verification at the end of each phase.
 
-**Read this first:** the public-network guardrails in `apps/api/src/env.ts`
-throw at boot rather than warn. A service that refuses to start is loud; one
-that quietly settles into a sandbox anchor is not. If a guard fires, fix the
-configuration — never relax the guard to get a green deploy.
+**Read this first:** the public-network guardrails throw at boot rather than
+warn. A service that refuses to start is loud; one that quietly settles into a
+sandbox anchor is not. The guards are split across two files: the OFFRAMP and
+anchor-URL checks fire in `apps/api/src/env.ts` at module load (lines
+114–142), as does the USDC issuer check (line 189); the
+`DEFAULT_SELLER_WALLET` (line 386),
+`SERVER_SIGNING_SECRET` (line 489), and `JWT_SECRET` (line 512) checks fire in
+`apps/api/src/services/container.ts` inside `createContainer()`. If a guard
+fires, fix the configuration — never relax the guard to get a green deploy.
 
 ---
 
@@ -30,7 +35,11 @@ configuration — never relax the guard to get a green deploy.
 | Missing `JWT_SECRET` | Every seller is logged out on each deploy. |
 | A blank or non-numeric numeric var | A blank value used to yield `0` — `TRUST_PROXY_HOPS=` silently collapsed every client into one rate-limit bucket. A typo yields `NaN`, and `setInterval(NaN)` is a tight loop against Horizon, not a slow poll. |
 
-These are covered by `apps/api/test/env-mainnet-guards.test.ts`.
+The OFFRAMP, USDC issuer, anchor-URL, and KYC key guards are covered by
+`apps/api/test/env-mainnet-guards.test.ts`. The `DEFAULT_SELLER_WALLET`,
+`SERVER_SIGNING_SECRET`, and `JWT_SECRET` guards live in
+`apps/api/src/services/container.ts` and are not yet covered by a dedicated
+test file.
 
 ---
 
@@ -185,7 +194,22 @@ testnet one.
 This one is easy to miss and fails opaquely: the browser signs with the
 passphrase this variable selects, so leaving it unset means every wallet
 signature is built for testnet and rejected by the network the API is watching —
-with no error message that names the cause. Also set:
+with no error message that names the cause. Like every `NEXT_PUBLIC_*`
+variable, this is baked into the client bundle **at build time** — changing
+it and redeploying without rebuilding does nothing; the old value is still
+what's in the bundle a visitor's browser downloads.
+
+`NEXT_PUBLIC_API_URL` has the exact same failure shape, and it has actually
+happened: a Vercel build once ran with this unset, so the code's own
+`http://localhost:8787` local-dev fallback got baked into the production
+bundle instead, and every visitor's browser silently tried (and failed) to
+reach `localhost:8787` **on their own machine** — "Create link" just did
+nothing, no error naming the cause (`docs/FIXLOG.md`, BUG-1.4). The fallback
+now only applies outside a production build; a production build with this
+unset fails loudly in the browser instead, at load time, rather than issuing
+doomed requests — but that guard only catches "unset," not "wrong region/
+wrong deployment," so still set it deliberately rather than relying on the
+guard to catch a typo'd URL. Also set:
 
 - `NEXT_PUBLIC_API_URL` / `API_URL` — the mainnet API origin
 - `NEXT_PUBLIC_ENABLE_WALLET_PAY=true` — enable the lazy-loaded desktop wallet
@@ -274,10 +298,15 @@ replaying local state.
 Not blockers for a first cutover, but each has a real production cost:
 
 - **`REDIS_URL` unset.** Rate-limit counters live in an in-process `Map`, so N
-  instances allow N times the configured limit. Set it before scaling past one
-  instance.
-- **`scripts/demo-seed.ts` and `demo-reset.ts` are testnet-only.** They hardcode
-  `Networks.TESTNET` and friendbot. Do not run them against mainnet.
+  instances allow N times the configured limit. SEP-10 challenge single-use
+  tracking has the same gap: without it, the same signed challenge can be
+  redeemed once per instance instead of once, ever. Set it before scaling past
+  one instance.
+- **`apps/api/scripts/demo-seed.ts` reads `STELLAR_NETWORK` like the API does**,
+  but Friendbot and the testanchor USDC dispenser only exist on testnet — on
+  public network it skips both with a clear message and expects the generated
+  buyer keypair to already be funded, or the payment step fails with the real
+  Horizon error rather than an obscure one.
 - **`.github/workflows/anchor-probe.yml` probes `testanchor.stellar.org`** and
   auto-files a GitHub issue when that sandbox is down. On a mainnet project it
   is watching the wrong host — repoint it at your anchor or disable it.

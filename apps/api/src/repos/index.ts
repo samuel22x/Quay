@@ -1,4 +1,6 @@
-import { eq, and, inArray, lt, lte } from "drizzle-orm";
+import { and, desc, eq, inArray, isNotNull, isNull, lt, lte, or } from "drizzle-orm";
+import type { ApiKeyScope } from "../services/api-keys";
+import { decodeScopesFromDb, encodeScopesForDb } from "../services/api-keys";
 import type {
   CreateLinkInput,
   KycFieldSpec,
@@ -244,6 +246,23 @@ export class DrizzleLinkRepository implements LinkRepository {
     return rows.length;
   }
 
+  /**
+   * The oldest demo-flagged link, or null when the demo has not been seeded.
+   *
+   * Oldest rather than newest so the /demo page keeps pointing at the same
+   * link across re-seeds that only append — the seed script creates its
+   * headline "Handcrafted Ceramic Mug" row first.
+   */
+  async findDemo(): Promise<PaymentLink | null> {
+    const rows = await this.db
+      .select()
+      .from(links)
+      .where(eq(links.isDemo, true))
+      .orderBy(links.createdAt)
+      .limit(1);
+    return rows[0] ? rowToLink(rows[0]) : null;
+  }
+
   async recordPayment(payment: LinkPaymentRecord): Promise<void> {
     await this.db
       .insert(linkPayments)
@@ -251,6 +270,7 @@ export class DrizzleLinkRepository implements LinkRepository {
         id: newId("pmt"),
         linkId: payment.linkId,
         txHash: payment.txHash,
+        operationId: payment.operationId,
         payer: payment.payer,
         amount: payment.amount,
         assetCode: payment.asset.code,
@@ -258,7 +278,7 @@ export class DrizzleLinkRepository implements LinkRepository {
         ledger: payment.ledger,
         createdAt: payment.createdAt,
       })
-      .onConflictDoNothing({ target: linkPayments.txHash });
+      .onConflictDoNothing({ target: [linkPayments.txHash, linkPayments.operationId] });
   }
 
   async paymentLedger(txHash: string): Promise<number | null> {
@@ -402,12 +422,55 @@ export class DrizzleWebhookRepository implements WebhookRepository {
     return rows.map(rowToWebhook);
   }
 
-  async findWebhookById(id: string): Promise<Webhook | null> {
-    const rows = await this.db.select().from(webhooks).where(eq(webhooks.id, id)).limit(1);
-    return rows[0] ?? null;
+  async getById(id: string, sellerId: string, opts?: { includeDeleted?: boolean }): Promise<Webhook | null> {
+    const conditions = [eq(webhooks.id, id), eq(webhooks.sellerId, sellerId)];
+    if (!opts?.includeDeleted) conditions.push(isNull(webhooks.deletedAt));
+    const rows = await this.db
+      .select()
+      .from(webhooks)
+      .where(and(...conditions))
+      .limit(1);
+    return rows[0] ? rowToWebhook(rows[0]) : null;
   }
 
-  async recordDelivery(d: WebhookDelivery): Promise<void> {
+  /**
+   * Unscoped lookup. Only the delivery worker uses this: it drains the queue
+   * outside any request, so there is no seller in scope to check against.
+   * Routes must keep using `getById`, which enforces ownership.
+   */
+  async findWebhookById(id: string): Promise<Webhook | null> {
+    const rows = await this.db.select().from(webhooks).where(eq(webhooks.id, id)).limit(1);
+    return rows[0] ? rowToWebhook(rows[0]) : null;
+  }
+
+  async rotateSecret(id: string, sellerId: string, newSecret: string, overlapMs: number): Promise<Webhook | null> {
+    const existing = await this.getById(id, sellerId);
+    if (!existing) return null;
+
+    const updated = {
+      secretEncrypted: encryptSecret(newSecret),
+      secretLast4: last4(newSecret),
+      previousSecretEncrypted: existing.secretEncrypted,
+      previousSecretLast4: existing.secretLast4,
+      previousSecretExpiresAt: Date.now() + overlapMs,
+    };
+    await this.db
+      .update(webhooks)
+      .set(updated)
+      .where(and(eq(webhooks.id, id), eq(webhooks.sellerId, sellerId)));
+
+    return { ...existing, ...updated };
+  }
+
+  async softDelete(id: string, sellerId: string): Promise<boolean> {
+    const result = await this.db
+      .update(webhooks)
+      .set({ deletedAt: Date.now() })
+      .where(and(eq(webhooks.id, id), eq(webhooks.sellerId, sellerId), isNull(webhooks.deletedAt)));
+    return (result.rowsAffected ?? 0) > 0;
+  }
+
+  async recordDelivery(d: Omit<WebhookDelivery, "id" | "createdAt">): Promise<void> {
     await this.db.insert(webhookDeliveries).values({
       id: newId("whd"),
       webhookId: d.webhookId,
@@ -522,6 +585,36 @@ export class DrizzleWebhookRepository implements WebhookRepository {
     return rows[0] ? rowToQueueEntry(rows[0]) : null;
   }
 
+  async listDeliveries(
+    webhookId: string,
+    sellerId: string,
+    opts: { limit: number; cursor?: string | null },
+  ): Promise<{ deliveries: WebhookDelivery[]; nextCursor: string | null }> {
+    // Ownership check — a merchant may only read deliveries for their own
+    // webhook. Deleted webhooks are included on purpose: history must stay
+    // visible after an endpoint is removed.
+    const owned = await this.getById(webhookId, sellerId, { includeDeleted: true });
+    if (!owned) return { deliveries: [], nextCursor: null };
+
+    const cursorCreatedAt = opts.cursor ? decodeDeliveryCursor(opts.cursor) : null;
+    const conditions = [eq(webhookDeliveries.webhookId, webhookId)];
+    if (cursorCreatedAt !== null) conditions.push(lt(webhookDeliveries.createdAt, cursorCreatedAt));
+
+    // Fetch one extra row to know whether there's a next page.
+    const rows = await this.db
+      .select()
+      .from(webhookDeliveries)
+      .where(and(...conditions))
+      .orderBy(desc(webhookDeliveries.createdAt))
+      .limit(opts.limit + 1);
+
+    const page = rows.slice(0, opts.limit);
+    const last = page[page.length - 1];
+    const nextCursor = rows.length > opts.limit && last ? encodeDeliveryCursor(last.createdAt) : null;
+
+    return { deliveries: page, nextCursor };
+  }
+
   async listDeliveriesByLinkId(linkId: string): Promise<WebhookDelivery[]> {
     const rows = await this.db
       .select()
@@ -560,6 +653,8 @@ function rowToQueueEntry(row: QueueRow): WebhookQueueEntry {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
 function encodeDeliveryCursor(createdAt: number): string {
   return Buffer.from(String(createdAt), "utf8").toString("base64url");
 }
@@ -592,20 +687,27 @@ export class DrizzleWatcherStateRepository implements WatcherStateRepository {
       });
   }
 
-  async isProcessed(txHash: string): Promise<boolean> {
+  async isProcessed(txHash: string, operationId: string): Promise<boolean> {
     const rows = await this.db
       .select({ txHash: processedTx.txHash })
       .from(processedTx)
-      .where(eq(processedTx.txHash, txHash))
+      .where(
+        and(
+          eq(processedTx.txHash, txHash),
+          // Exact operation already recorded, OR a pre-migration row marked
+          // the whole transaction (operation_id NULL) — see schema.ts.
+          or(eq(processedTx.operationId, operationId), isNull(processedTx.operationId)),
+        ),
+      )
       .limit(1);
     return rows.length > 0;
   }
 
-  async markProcessed(txHash: string, linkId: string | null): Promise<void> {
+  async markProcessed(txHash: string, operationId: string, linkId: string | null): Promise<void> {
     await this.db
       .insert(processedTx)
-      .values({ txHash, linkId, createdAt: Date.now() })
-      .onConflictDoNothing();
+      .values({ txHash, operationId, linkId, createdAt: Date.now() })
+      .onConflictDoNothing({ target: [processedTx.txHash, processedTx.operationId] });
   }
 }
 

@@ -34,16 +34,12 @@ export default async function ReceiptPage({ params }: { params: Promise<{ refere
     receipt = await api.getReceipt(reference);
   } catch {
     return (
-      <html lang="en">
-        <body>
-          <main className="shell shell--narrow" style={{ textAlign: "center", paddingTop: 80 }}>
-            <div className="panel">
-              <h2 style={{ fontSize: 18, marginBottom: 8, color: "var(--text)" }}>Receipt not found</h2>
-              <p className="muted">No payment found for this reference. The link may still be awaiting payment, or the reference is incorrect.</p>
-            </div>
-          </main>
-        </body>
-      </html>
+      <main className="shell shell--narrow" style={{ textAlign: "center", paddingTop: 80 }}>
+        <div className="panel">
+          <h2 style={{ fontSize: 18, marginBottom: 8, color: "var(--text)" }}>Receipt not found</h2>
+          <p className="muted">No payment found for this reference. The link may still be awaiting payment, or the reference is incorrect.</p>
+        </div>
+      </main>
     );
   }
 

@@ -69,6 +69,23 @@ export function apiKeyRoutes(c: Container): Hono<{ Variables: AuthVariables }> {
       );
     }
 
+    // Prevent privilege escalation: a key may only mint keys whose scopes are a
+    // subset of its own. Session-authenticated sellers are the authority the
+    // keys derive from, so they may still request any scope.
+    if (ctx.get("authKind") === "api_key") {
+      const callerScopes = ctx.get("scopes") ?? [];
+      const denied = scopes.filter((s) => !callerScopes.includes(s));
+      if (denied.length > 0) {
+        return ctx.json(
+          {
+            error: "forbidden",
+            issues: [{ message: `Requested scope(s) not held by calling key: ${denied.join(", ")}` }],
+          },
+          403,
+        );
+      }
+    }
+
     const { plaintext, prefix } = generateApiKey(parsed.data.env as KeyEnvironment);
     const hash = await hashApiKey(plaintext);
 

@@ -35,6 +35,7 @@ import {
   type WatcherMetrics,
 } from "../worker/watcher-loop";
 import { ChallengeService } from "./challenge";
+import { RedisUsedChallengeStore } from "./redis-used-challenge-store";
 import { horizonSignerFetcher } from "./horizon-signers";
 import { SessionIssuer } from "./session";
 import type { StellarTomlConfig } from "../routes/well-known";
@@ -192,6 +193,9 @@ export async function createContainer(): Promise<Container> {
     webAuthDomain: env.webAuthDomain,
     networkPassphrase: stellar.networkPassphrase,
     fetchAccountSigners: horizonSignerFetcher(stellar.horizonUrl),
+    // Same REDIS_URL branch the rate limiter uses (index.ts) — without it,
+    // "single-use" only holds per process (issue 6.7).
+    usedChallengeStore: env.redisUrl ? new RedisUsedChallengeStore(env.redisUrl) : undefined,
   });
   const session = new SessionIssuer(resolveJwtSecret());
   const stellarToml: StellarTomlConfig = {

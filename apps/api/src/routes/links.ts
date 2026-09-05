@@ -251,7 +251,8 @@ export function linkRoutes(c: Container, strictRateLimit: MiddlewareHandler): Ho
       }
       const { job, initiation } = await c.service.triggerCashOut(linkId, parsed.data, { logger: log });
       log.info({ event: "cashout.request.ok", linkId, jobId: job.jobId }, "cash-out request succeeded");
-      return ctx.json({ job, initiation });
+      const interactiveUrl = initiation.kind === "interactive" ? initiation.url : undefined;
+      return ctx.json({ job, interactiveUrl });
     } catch (err) {
       if (err instanceof OffRampDisabledError) {
         log.warn({ event: "cashout.request.disabled", linkId }, "cash-out requested but off-ramp is disabled");

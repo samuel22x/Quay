@@ -119,6 +119,23 @@ describe("POST /links", () => {
     expect(link.expiresAt).toBeTypeOf("number");
     expect((link.expiresAt as number)).toBeGreaterThan(Date.now());
   });
+
+  // A caller must never get to choose a link id. `demo_mug_123` was briefly
+  // going to be seedable this way; the /demo page reads the real id from
+  // GET /demo/link instead, so there is no reason to accept one — and a
+  // predictable id on a payment link is a bad thing to be able to request.
+  it("ignores a caller-supplied id — link ids are always server-generated lnk_…", async () => {
+    const res = await req("/links", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: "Guessable", amount: "10", isDemo: true, id: "guessable_id" }),
+    });
+    expect(res.status).toBe(201);
+    const body = await res.json() as Record<string, unknown>;
+    const id = (body.link as Record<string, unknown>).id as string;
+    expect(id).not.toBe("guessable_id");
+    expect(id).toMatch(/^lnk_/);
+  });
 });
 
 // ---------------------------------------------------------------------------

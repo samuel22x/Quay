@@ -636,6 +636,7 @@ export class LinkService {
       await this.deps.links.recordPayment({
         linkId: link.id,
         txHash: payment.txHash,
+        operationId: payment.pagingToken,
         payer: payment.from,
         amount: normalizeAmount(payment.amount),
         asset: payment.asset,
@@ -678,6 +679,7 @@ export class LinkService {
       await this.deps.links.recordPayment({
         linkId: link.id,
         txHash: payment.txHash,
+        operationId: payment.pagingToken,
         payer: payment.from,
         amount: normalizeAmount(payment.amount),
         asset: payment.asset,

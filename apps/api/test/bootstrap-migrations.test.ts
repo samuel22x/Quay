@@ -1,6 +1,8 @@
 import { describe, it, expect } from "vitest";
 import { createClient } from "@libsql/client";
+import { drizzle } from "drizzle-orm/libsql";
 import { bootstrap } from "../src/db/client";
+import { DrizzleWatcherStateRepository } from "../src/repos/index";
 import * as schema from "../src/db/schema";
 import { getTableConfig } from "drizzle-orm/sqlite-core";
 
@@ -34,6 +36,11 @@ const LEGACY_LINK_PAYMENTS = `CREATE TABLE link_payments (
   payer TEXT NOT NULL, amount TEXT NOT NULL,
   asset_code TEXT NOT NULL, asset_issuer TEXT,
   created_at INTEGER NOT NULL
+)`;
+
+/** `processed_tx` as it shipped before issue 4.11 — tx_hash alone as the key. */
+const LEGACY_PROCESSED_TX = `CREATE TABLE processed_tx (
+  tx_hash TEXT PRIMARY KEY, link_id TEXT, created_at INTEGER NOT NULL
 )`;
 
 // Copied verbatim from the production database's own sqlite_master, not
@@ -143,6 +150,89 @@ describe("bootstrap() against a pre-existing database", () => {
     expect(await columnsOf(client, "sellers")).toContain("payout_fields_json");
   });
 
+  // Issue 4.11 rebuilds processed_tx and link_payments rather than ALTERing
+  // them — SQLite cannot move a column into or out of a PRIMARY KEY. A rebuild
+  // that drops rows is a money bug: processed_tx is the dedup ledger, so
+  // losing it re-credits payments that already settled.
+  it("preserves every processed_tx row through the 4.11 rebuild", async () => {
+    const client = createClient({ url: "file::memory:" });
+    await client.execute(LEGACY_PROCESSED_TX);
+    await client.execute(
+      `INSERT INTO processed_tx (tx_hash, link_id, created_at) VALUES
+         ('tx_old_1', 'lnk_a', 1000),
+         ('tx_old_2', NULL, 2000)`,
+    );
+
+    await bootstrap(client);
+
+    const rows = await client.execute("SELECT tx_hash, operation_id, link_id, created_at FROM processed_tx ORDER BY tx_hash");
+    expect(rows.rows.map((r) => String(r.tx_hash))).toEqual(["tx_old_1", "tx_old_2"]);
+    // Legacy rows carry no operation id — that is what makes them mean
+    // "the whole transaction was processed".
+    expect(rows.rows.every((r) => r.operation_id === null)).toBe(true);
+    expect(String(rows.rows[0]!.link_id)).toBe("lnk_a");
+    expect(Number(rows.rows[0]!.created_at)).toBe(1000);
+  });
+
+  it("preserves every link_payments row through the 4.11 rebuild", async () => {
+    const client = createClient({ url: "file::memory:" });
+    await client.execute(LEGACY_LINK_PAYMENTS);
+    await client.execute(
+      `INSERT INTO link_payments (id, link_id, tx_hash, payer, amount, asset_code, asset_issuer, created_at)
+       VALUES ('pmt_1', 'lnk_a', 'tx_old_1', 'GPAYER', '10', 'USDC', 'GISSUER', 1000)`,
+    );
+
+    await bootstrap(client);
+
+    const rows = await client.execute("SELECT id, tx_hash, operation_id, amount, ledger FROM link_payments");
+    expect(rows.rows).toHaveLength(1);
+    expect(String(rows.rows[0]!.id)).toBe("pmt_1");
+    expect(String(rows.rows[0]!.amount)).toBe("10");
+    expect(rows.rows[0]!.operation_id).toBe(null);
+    // The legacy fixture predates the `ledger` column; the rebuild must not
+    // assume it was there.
+    expect(rows.rows[0]!.ledger).toBe(null);
+  });
+
+  // The dedup semantics the migration promises: a pre-4.11 row means the whole
+  // transaction is done, so a replay of any operation in it is still a
+  // duplicate. Without this, every payment settled before the migration could
+  // be credited a second time.
+  it("treats a migrated NULL-operation row as covering the whole transaction", async () => {
+    const client = createClient({ url: "file::memory:" });
+    await client.execute(LEGACY_PROCESSED_TX);
+    await client.execute(
+      "INSERT INTO processed_tx (tx_hash, link_id, created_at) VALUES ('tx_settled', 'lnk_a', 1000)",
+    );
+    await bootstrap(client);
+
+    const state = new DrizzleWatcherStateRepository(drizzle(client, { schema }));
+
+    expect(await state.isProcessed("tx_settled", "any-operation-id")).toBe(true);
+    expect(await state.isProcessed("tx_settled", "another-one")).toBe(true);
+    expect(await state.isProcessed("tx_never_seen", "1")).toBe(false);
+  });
+
+  // Two operations in one transaction must each get their own row — that is
+  // the entire point of the re-key.
+  it("records two operations of one transaction independently after migrating", async () => {
+    const client = createClient({ url: "file::memory:" });
+    await client.execute(LEGACY_PROCESSED_TX);
+    await bootstrap(client);
+
+    const state = new DrizzleWatcherStateRepository(drizzle(client, { schema }));
+    await state.markProcessed("tx_split", "op_1", "lnk_a");
+
+    expect(await state.isProcessed("tx_split", "op_1")).toBe(true);
+    expect(await state.isProcessed("tx_split", "op_2")).toBe(false);
+
+    await state.markProcessed("tx_split", "op_2", "lnk_a");
+    expect(await state.isProcessed("tx_split", "op_2")).toBe(true);
+
+    const rows = await client.execute("SELECT operation_id FROM processed_tx WHERE tx_hash = 'tx_split'");
+    expect(rows.rows).toHaveLength(2);
+  });
+
   it("is idempotent — a second run over a migrated database is a no-op", async () => {
     const client = createClient({ url: "file::memory:" });
     await client.execute(LEGACY_LINKS);
@@ -163,12 +253,13 @@ describe("bootstrap() against a pre-existing database", () => {
     await legacy.execute(LEGACY_LINKS);
     await legacy.execute(LEGACY_LINK_PAYMENTS);
     await legacy.execute(LEGACY_SELLERS);
+    await legacy.execute(LEGACY_PROCESSED_TX);
     await bootstrap(legacy);
 
     const fresh = createClient({ url: "file::memory:" });
     await bootstrap(fresh);
 
-    for (const table of ["links", "link_payments", "sellers"]) {
+    for (const table of ["links", "link_payments", "sellers", "processed_tx"]) {
       const a = (await columnsOf(legacy, table)).slice().sort();
       const b = (await columnsOf(fresh, table)).slice().sort();
       expect(a, `${table} columns drifted between the fresh and migrated paths`).toEqual(b);

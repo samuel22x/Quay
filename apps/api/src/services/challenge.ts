@@ -1,6 +1,36 @@
 import { Keypair, StrKey, WebAuth } from "@stellar/stellar-sdk";
+import type { UsedChallengeStore } from "@checkout/core";
 
 export class AuthError extends Error {}
+
+/**
+ * Default single-process implementation of {@link UsedChallengeStore}. Only
+ * enforces "used once per process" — see the port's own doc comment for why
+ * that's not enough once more than one instance is running. Select
+ * `RedisUsedChallengeStore` (services/redis-used-challenge-store.ts) instead
+ * when `REDIS_URL` is set, the same way the rate limiter does.
+ */
+export class MemoryUsedChallengeStore implements UsedChallengeStore {
+  // tx hash -> epoch-seconds it stops mattering (== the challenge's own maxTime).
+  private readonly used = new Map<string, number>();
+
+  async claim(hash: string, expiresAt: number): Promise<boolean> {
+    this.sweepExpired();
+    if (this.used.has(hash)) return false;
+    // Synchronous Map.set — no await between the `has` check above and this,
+    // so no other call can interleave. Safe within a single process; a
+    // multi-process deployment needs RedisUsedChallengeStore instead.
+    this.used.set(hash, expiresAt);
+    return true;
+  }
+
+  private sweepExpired(): void {
+    const now = Math.floor(Date.now() / 1000);
+    for (const [hash, exp] of this.used) {
+      if (exp < now) this.used.delete(hash);
+    }
+  }
+}
 
 /** An account's ed25519 signers and its medium threshold, as reported by Horizon.
  *  `null` means the account does not exist on-chain yet (unfunded); SEP-10 then
@@ -17,6 +47,9 @@ export interface ChallengeOptions {
   fetchAccountSigners: FetchAccountSigners;
   /** Challenge validity window in seconds. Default 900 (15 minutes). */
   timeoutSeconds?: number;
+  /** Defaults to a per-process `MemoryUsedChallengeStore`. Pass a
+   *  `RedisUsedChallengeStore` to share the single-use claim across instances. */
+  usedChallengeStore?: UsedChallengeStore;
 }
 
 /**
@@ -29,10 +62,11 @@ export interface ChallengeOptions {
  * the M-of-N threshold lookup via Horizon.
  */
 export class ChallengeService {
-  // tx hash -> epoch-seconds it stops mattering (== the challenge's own maxTime).
-  private readonly used = new Map<string, number>();
+  private readonly usedChallengeStore: UsedChallengeStore;
 
-  constructor(private readonly opts: ChallengeOptions) {}
+  constructor(private readonly opts: ChallengeOptions) {
+    this.usedChallengeStore = opts.usedChallengeStore ?? new MemoryUsedChallengeStore();
+  }
 
   build(account: string): { transaction: string; network_passphrase: string } {
     if (!StrKey.isValidEd25519PublicKey(account)) {
@@ -51,8 +85,6 @@ export class ChallengeService {
 
   /** Verifies a client-signed challenge and returns the authenticated account id. */
   async verify(transactionXdr: string): Promise<string> {
-    this.sweepExpired();
-
     let clientAccountID: string;
     let hash: string;
     try {
@@ -67,10 +99,6 @@ export class ChallengeService {
       hash = read.tx.hash().toString("hex");
     } catch (err) {
       throw new AuthError(`invalid challenge transaction: ${errMessage(err)}`);
-    }
-
-    if (this.used.has(hash)) {
-      throw new AuthError("challenge has already been used");
     }
 
     const account = await this.opts.fetchAccountSigners(clientAccountID);
@@ -107,16 +135,16 @@ export class ChallengeService {
 
     // Single-use: once verified, this exact challenge can never be redeemed again.
     // Kept only until its own timebounds lapse, since it would be rejected anyway.
-    this.used.set(hash, Math.floor(Date.now() / 1000) + (this.opts.timeoutSeconds ?? 900));
+    // This is the atomic claim, not a check-then-set — with RedisUsedChallengeStore
+    // it's a `SET NX`, so two instances racing the same signed challenge cannot
+    // both win even though both independently pass signature verification above.
+    const expiresAt = Math.floor(Date.now() / 1000) + (this.opts.timeoutSeconds ?? 900);
+    const claimed = await this.usedChallengeStore.claim(hash, expiresAt);
+    if (!claimed) {
+      throw new AuthError("challenge has already been used");
+    }
 
     return clientAccountID;
-  }
-
-  private sweepExpired(): void {
-    const now = Math.floor(Date.now() / 1000);
-    for (const [hash, exp] of this.used) {
-      if (exp < now) this.used.delete(hash);
-    }
   }
 }
 

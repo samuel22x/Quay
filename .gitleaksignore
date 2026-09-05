@@ -1,0 +1,16 @@
+# Gitleaks findings that are false positives, by fingerprint
+# (commit:file:rule:line). Only add entries here for values verified as
+# non-credentials — never to silence a real leak.
+
+# Placeholder API keys in the uptime-check unit tests (PR #181, issue 8.9).
+# `generic-api-key` matched fixture strings like "ak_live_test123" passed to
+# checkSyntheticLink. A real key is `ak_live_` followed by 32 base62 chars
+# (apps/api/src/services/api-keys.ts), so these are far too short to be one,
+# and they were only ever handed to a mocked fetch. The fixtures on the
+# current tree were renamed so the rule no longer matches; these entries
+# cover the historical commit, which gitleaks still scans.
+558c075f26a6969d82728db03e14993ae87749a9:scripts/uptime-check.test.ts:generic-api-key:41
+558c075f26a6969d82728db03e14993ae87749a9:scripts/uptime-check.test.ts:generic-api-key:74
+558c075f26a6969d82728db03e14993ae87749a9:scripts/uptime-check.test.ts:generic-api-key:89
+558c075f26a6969d82728db03e14993ae87749a9:scripts/uptime-check.test.ts:generic-api-key:101
+558c075f26a6969d82728db03e14993ae87749a9:scripts/uptime-check.test.ts:generic-api-key:114

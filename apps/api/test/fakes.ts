@@ -1,6 +1,7 @@
 import {
   fromStroops,
   toStroops,
+  type AssetRef,
   type CreateLinkInput,
   type KycPort,
   type KycRecord,
@@ -17,6 +18,7 @@ import {
   type OffRampTelemetrySummary,
   type PaymentLink,
   type PayoutFieldDescriptor,
+  type SellerPayoutRef,
   type StoredOffRampJob,
   type StoredOffRampQuote,
   type Webhook,
@@ -302,12 +304,16 @@ export class ScriptedOffRamp implements OffRampPort {
   statusImpl: (jobId: string) => Promise<OffRampJob> = () => {
     throw new Error("statusImpl not configured");
   };
+  quoteImpl?: (input: { linkId: string; sourceAsset: AssetRef; sourceAmount: string; targetCurrency: string }) => Promise<OffRampQuote>;
+  initiateImpl?: (input: { linkId: string; quoteId: string; payout: SellerPayoutRef }) => Promise<OffRampInitiation>;
 
-  async quote(): Promise<OffRampQuote> {
-    throw new Error("not used in these tests");
+  async quote(input: { linkId: string; sourceAsset: AssetRef; sourceAmount: string; targetCurrency: string }): Promise<OffRampQuote> {
+    if (this.quoteImpl) return this.quoteImpl(input);
+    throw new Error("quoteImpl not configured");
   }
-  async initiate(): Promise<OffRampInitiation> {
-    throw new Error("not used in these tests");
+  async initiate(input: { linkId: string; quoteId: string; payout: SellerPayoutRef }): Promise<OffRampInitiation> {
+    if (this.initiateImpl) return this.initiateImpl(input);
+    throw new Error("initiateImpl not configured");
   }
   async status(jobId: string): Promise<OffRampJob> {
     return this.statusImpl(jobId);

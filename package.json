@@ -16,10 +16,11 @@
     "docs:status-diagram": "node scripts/gen-status-diagram.mjs",
     "docs:check-status-diagram": "node scripts/gen-status-diagram.mjs --check",
     "docs:check-domain-boundary": "node scripts/check-domain-boundary.mjs",
+    "docs:check-env-docs": "node scripts/check-env-docs.mjs",
     "sweep": "node scripts/uptime-check.mjs",
     "secrets:mainnet": "pnpm --filter @checkout/api exec node scripts/gen-mainnet-secrets.mjs",
-    "demo:seed": "tsx scripts/demo-seed.ts",
-    "demo:reset": "tsx scripts/demo-reset.ts"
+    "demo:seed": "pnpm --filter @checkout/api exec tsx scripts/demo-seed.ts",
+    "demo:reset": "pnpm --filter @checkout/api exec tsx scripts/demo-reset.ts"
   },
   "dependencies": {
     "@libsql/client": "0.17.4"

@@ -65,11 +65,16 @@ export const links = sqliteTable("links", {
 
 // Authoritative ledger of every payment recorded against a link — cumulative
 // accounting (issue 1.4) sums these rather than trusting a single payment.
-// `txHash` is unique so a reprocessed payment can never double-count.
+// Unique on (tx_hash, operation_id) — see `migrateLegacyLinkPaymentsTable` in
+// db/client.ts — not tx_hash alone: a transaction can carry more than one
+// payment operation to the same link (issue 4.11), and each is its own row.
 export const linkPayments = sqliteTable("link_payments", {
   id: text("id").primaryKey(),
   linkId: text("link_id").notNull(),
-  txHash: text("tx_hash").notNull().unique(),
+  txHash: text("tx_hash").notNull(),
+  /** Horizon's per-operation pagingToken. NULL only on rows written before
+   *  this column existed — see `migrateLegacyLinkPaymentsTable`. */
+  operationId: text("operation_id"),
   payer: text("payer").notNull(),
   amount: text("amount").notNull(),
   assetCode: text("asset_code").notNull(),
@@ -182,8 +187,16 @@ export const watcherCursors = sqliteTable("watcher_cursors", {
   updatedAt: integer("updated_at").notNull(),
 });
 
+// Dedup ledger for the watcher (issue 4.11). Keyed on (tx_hash, operation_id)
+// — see `migrateLegacyProcessedTxTable` in db/client.ts — not tx_hash alone: a
+// Stellar transaction can carry up to 100 operations, and a payment is one
+// operation, not the whole transaction. `operation_id` is Horizon's
+// pagingToken; it's NULL only on rows migrated from before this column
+// existed, and `isProcessed` treats a NULL row as "the whole transaction was
+// processed" to preserve the dedup behavior anything already settled had.
 export const processedTx = sqliteTable("processed_tx", {
-  txHash: text("tx_hash").primaryKey(),
+  txHash: text("tx_hash").notNull(),
+  operationId: text("operation_id"),
   linkId: text("link_id"),
   createdAt: integer("created_at").notNull(),
 });

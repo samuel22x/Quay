@@ -71,10 +71,14 @@ function makeFakeStateRepo() {
       cursors.set(account, cursor);
       setCursorCalls.push(cursor);
     },
-    async isProcessed(txHash: string): Promise<boolean> {
+    // Keyed by txHash alone here (not the real per-operation key) — this file
+    // tests backlog draining/pagination, not issue 4.11's multi-operation
+    // dedup, and every payment in it has a unique txHash, so this stays
+    // behaviorally equivalent while satisfying the WatcherStateRepository shape.
+    async isProcessed(txHash: string, _operationId: string): Promise<boolean> {
       return processed.has(txHash);
     },
-    async markProcessed(txHash: string): Promise<void> {
+    async markProcessed(txHash: string, _operationId: string): Promise<void> {
       processed.add(txHash);
     },
   };

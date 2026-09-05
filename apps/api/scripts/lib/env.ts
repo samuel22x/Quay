@@ -2,9 +2,10 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 
 /**
- * Minimal dependency-free .env loader for the root scripts. Reads the first
- * .env found at ./ (cwd) or ../../ (repo root), without overwriting vars that
- * are already set in the process environment.
+ * Minimal dependency-free .env loader for these demo scripts. Reads the first
+ * .env found at ./ (cwd) or ../../ (repo root — these scripts run from
+ * apps/api via `pnpm --filter @checkout/api exec tsx scripts/...`), without
+ * overwriting vars that are already set in the process environment.
  */
 export function loadEnvFile(): Record<string, string> {
   const candidates = [
@@ -39,4 +40,9 @@ export function envValue(envFile: Record<string, string>, key: string, fallback?
   const v = process.env[key] ?? envFile[key] ?? fallback;
   if (v === undefined) throw new Error(`Missing required config: ${key}`);
   return v;
+}
+
+/** Same lookup as envValue, but returns undefined instead of throwing when unset. */
+export function envValueOptional(envFile: Record<string, string>, key: string): string | undefined {
+  return process.env[key] ?? envFile[key];
 }

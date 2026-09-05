@@ -146,14 +146,16 @@ sequenceDiagram
       LS->>LS: canTransition() guard, then links.save()
       LS->>Hooks: fireWebhook("link.paid" | "link.underpaid")
     end
-    Loop->>Loop: state.markProcessed(txHash), state.setCursor(account, lastToken)
+    Loop->>Loop: state.markProcessed(txHash, operationId), state.setCursor(account, lastToken)
   end
 ```
 
 Idempotency is layered on purpose: the persisted **cursor** avoids refetching old
 operations, the **processed-tx ledger** guards the crash window before a cursor is saved,
 and the domain's `canTransition()` guard means a duplicate payment can never double-apply
-even if both of the above somehow let it through.
+even if both of the above somehow let it through. The processed-tx ledger keys on
+`(txHash, operationId)`, not `txHash` alone — a transaction can carry more than one
+payment operation, and each dedupes independently (issue 4.11).
 
 ### 3. Cash-out — SEP-10 → SEP-38 → SEP-6 (`TestAnchorOffRamp`, today's real adapter)
 

@@ -415,7 +415,7 @@ export class WatcherLoop {
       for (const payment of payments) {
         lastToken = payment.pagingToken;
         const child = log.child({ txHash: payment.txHash, pagingToken: payment.pagingToken });
-        if (await this.deps.state.isProcessed(payment.txHash)) {
+        if (await this.deps.state.isProcessed(payment.txHash, payment.pagingToken)) {
           child.info({ event: "payment.duplicate" }, "skipping already-processed payment");
           continue;
         }
@@ -461,7 +461,7 @@ export class WatcherLoop {
           }
         }
 
-        await this.deps.state.markProcessed(payment.txHash, linkId);
+        await this.deps.state.markProcessed(payment.txHash, payment.pagingToken, linkId);
       }
 
       pageCursor = lastToken;

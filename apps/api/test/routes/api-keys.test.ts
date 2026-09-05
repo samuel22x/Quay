@@ -202,3 +202,72 @@ describe("api-keys:manage gating", () => {
     expect(((await revoked.json()) as Record<string, unknown>).error).toBe("invalid_api_key");
   });
 });
+
+describe("scope-subset rule on create (6.6 — a key cannot mint a more powerful key)", () => {
+  async function mintKey(name: string, scopes: string[]): Promise<string> {
+    const { generateApiKey, hashApiKey } = await import("../../src/services/api-keys");
+    const { plaintext, prefix } = generateApiKey("live");
+    const hash = await hashApiKey(plaintext);
+    await container.apiKeys.create({
+      sellerId,
+      name,
+      prefix,
+      hash,
+      scopes: scopes as never,
+    });
+    return plaintext;
+  }
+
+  async function createAs(plaintext: string, body: Record<string, unknown>): Promise<Response> {
+    return app.request("/api-keys", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${plaintext}` },
+      body: JSON.stringify(body),
+    });
+  }
+
+  it("a key without offramp:initiate cannot mint a key that has it — 403, offending scope named", async () => {
+    const narrow = await mintKey("narrow-rotator", ["api-keys:manage"]);
+    const res = await createAs(narrow, { name: "escalated", scopes: "api-keys:manage,offramp:initiate" });
+
+    expect(res.status).toBe(403);
+    const body = await res.json() as { error: string; issues: Array<{ message: string }> };
+    expect(body.error).toBe("forbidden");
+    const message = body.issues[0]?.message ?? "";
+    expect(message).toContain("offramp:initiate");
+    expect(message).not.toContain("api-keys:manage");
+  });
+
+  it("a key may mint an equal-or-narrower key — 201", async () => {
+    const caller = await mintKey("rotator", ["api-keys:manage", "links:read"]);
+    const res = await createAs(caller, { name: "narrower", scopes: "links:read" });
+
+    expect(res.status).toBe(201);
+    expect(((await res.json()) as { scopes: string[] }).scopes).toEqual(["links:read"]);
+  });
+
+  it("the default scopes are still subject to the rule — 403 when the caller lacks them", async () => {
+    // DEFAULT_SCOPES (links:read,links:write,webhooks:manage) apply when the
+    // request omits `scopes`; a caller holding only api-keys:manage holds none
+    // of them, so the implicit request must be rejected too.
+    const narrow = await mintKey("narrow-default", ["api-keys:manage"]);
+    const res = await createAs(narrow, { name: "implicit-defaults" });
+
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe("forbidden");
+  });
+
+  it("a wallet-session caller can still issue any scope — 201", async () => {
+    const res = await req("/api-keys", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name: "session-issued", scopes: "offramp:initiate,api-keys:manage" }),
+    });
+
+    expect(res.status).toBe(201);
+    expect(((await res.json()) as { scopes: string[] }).scopes).toEqual([
+      "offramp:initiate",
+      "api-keys:manage",
+    ]);
+  });
+});

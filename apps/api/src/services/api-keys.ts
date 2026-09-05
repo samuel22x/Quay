@@ -53,13 +53,19 @@ export function isValidScope(s: string): s is ApiKeyScope {
   return (ALL_SCOPES as readonly string[]).includes(s);
 }
 
-export function parseScopes(raw: string): ApiKeyScope[] {
-  if (!raw.trim()) return [...DEFAULT_SCOPES];
+export function parseScopes(raw: string, allowedScopes?: ApiKeyScope[]): ApiKeyScope[] {
+  if (!raw.trim()) {
+    const parsed = [...DEFAULT_SCOPES];
+    if (allowedScopes) assertScopesSubset(parsed, allowedScopes);
+    return parsed;
+  }
   const parts = raw.split(",").map((p) => p.trim()).filter(Boolean);
   for (const p of parts) {
     if (!isValidScope(p)) throw new Error(`Unknown scope: "${p}"`);
   }
-  return parts as ApiKeyScope[];
+  const parsed = parts as ApiKeyScope[];
+  if (allowedScopes) assertScopesSubset(parsed, allowedScopes);
+  return parsed;
 }
 
 export function encodeScopesForDb(scopes: ApiKeyScope[]): string {
@@ -71,6 +77,17 @@ export function decodeScopesFromDb(raw: string): ApiKeyScope[] {
     .split(",")
     .map((s) => s.trim())
     .filter(isValidScope) as ApiKeyScope[];
+}
+
+/**
+ * Throws if `requested` contains a scope not present in `allowed`.
+ * Used to prevent an API key from minting another key with elevated scopes.
+ */
+export function assertScopesSubset(requested: ApiKeyScope[], allowed: ApiKeyScope[]): void {
+  const denied = requested.filter((scope) => !allowed.includes(scope));
+  if (denied.length > 0) {
+    throw new Error(`Requested scopes not held by caller: ${denied.join(", ")}`);
+  }
 }
 
 // ── Key generation ────────────────────────────────────────────────────────

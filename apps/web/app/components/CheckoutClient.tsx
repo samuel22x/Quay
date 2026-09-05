@@ -52,7 +52,14 @@ function terminalCopy(status: string): { heading: string; detail: string } {
 
 // ── Component ───────────────────────────────────────────────────────────────
 
-export default function CheckoutClient({ initial }: { initial: LinkWithRequest }) {
+export default function CheckoutClient({
+  initial,
+  embed = false,
+}: {
+  initial: LinkWithRequest;
+  /** Rendered inside the widget's 440x680 iframe (issue 5.10) - drives tighter spacing/QR sizing via `.checkout--embed` (globals.css) and a smaller QR that CSS alone can't produce (the `size` prop is a real pixel value, not stylable). */
+  embed?: boolean;
+}) {
   const { request } = initial;
   const [link, setLink] = useState(initial.link);
   const [submittedTxHash, setSubmittedTxHash] = useState<string | null>(null);
@@ -142,7 +149,7 @@ export default function CheckoutClient({ initial }: { initial: LinkWithRequest }
 
   if (isSettled) {
     return (
-      <div className="checkout">
+      <div className={embed ? "checkout checkout--embed" : "checkout"}>
         <div className="settled-check" aria-hidden>
           ✓
         </div>
@@ -162,7 +169,7 @@ export default function CheckoutClient({ initial }: { initial: LinkWithRequest }
 
   if (submittedTxHash) {
     return (
-      <div className="checkout">
+      <div className={embed ? "checkout checkout--embed" : "checkout"}>
         <div className="status-icon" aria-hidden>
           ✓
         </div>
@@ -186,7 +193,7 @@ export default function CheckoutClient({ initial }: { initial: LinkWithRequest }
 
   if (link.status === "underpaid") {
     return (
-      <div className="checkout">
+      <div className={embed ? "checkout checkout--embed" : "checkout"}>
         <div className="error-icon" aria-hidden>
           ⚠
         </div>
@@ -212,7 +219,7 @@ export default function CheckoutClient({ initial }: { initial: LinkWithRequest }
   if (link.status === "expired" || link.status === "cancelled") {
     const copy = terminalCopy(link.status);
     return (
-      <div className="checkout">
+      <div className={embed ? "checkout checkout--embed" : "checkout"}>
         <div className="error-icon" aria-hidden>
           {link.status === "expired" ? "⏰" : "✕"}
         </div>
@@ -232,7 +239,7 @@ export default function CheckoutClient({ initial }: { initial: LinkWithRequest }
 
   if (connectionLost) {
     return (
-      <div className="checkout">
+      <div className={embed ? "checkout checkout--embed" : "checkout"}>
         <div className="error-icon" aria-hidden>
           ⚡
         </div>
@@ -251,7 +258,7 @@ export default function CheckoutClient({ initial }: { initial: LinkWithRequest }
   // ── RENDER: Active — waiting for payment ─────────────────────────────────
 
   return (
-    <div className="checkout">
+    <div className={embed ? "checkout checkout--embed" : "checkout"}>
       <div className="merchant">Pay merchant</div>
       <p className="title">{link.title}</p>
 
@@ -261,7 +268,7 @@ export default function CheckoutClient({ initial }: { initial: LinkWithRequest }
       </div>
 
       <div className="qr-wrap">
-        <QRCodeSVG value={request.uri} size={180} fgColor="#0b0f14" bgColor="#ffffff" level="M" />
+        <QRCodeSVG value={request.uri} size={embed ? 140 : 180} fgColor="#0b0f14" bgColor="#ffffff" level="M" />
       </div>
       <p className="muted" style={{ fontSize: 13 }}>
         Scan with a Stellar wallet, or

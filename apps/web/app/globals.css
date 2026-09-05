@@ -268,6 +268,50 @@ a { color: inherit; }
 .dash-link-title { color: var(--accent); text-decoration: none; font-weight: 500; }
 .dash-link-title:hover { text-decoration: underline; }
 
+/* ---------- embedded checkout (issue 5.10) ---------- */
+/* The widget's modal is a 440x680 (max) iframe - `.shell`'s page-level
+   max-width/centering/32-80px padding was designed for a full browser tab
+   and just crams into that. `.shell--embed` strips all of it; the widget's
+   own outer <div> (packages/widget/src/modal.ts) already provides the
+   rounded corners/border/shadow around the iframe, so the page inside it
+   only needs to fill the frame, not look like a card floating in a card. */
+.shell--embed {
+  max-width: none;
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+  display: flex;
+}
+
+.panel--embed {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  border: none;
+  border-radius: 0;
+  padding: 20px 16px;
+}
+
+/* Tighter than the default (and the existing <=560px breakpoint) - 440px is
+   narrower than that breakpoint already assumes, and every state here needs
+   to fit a 680px-tall frame with no page chrome to spare. Sized/checked
+   against the "active - waiting for payment" render, the tallest state
+   (title + amount + QR + memo note + status rail). */
+.checkout--embed .title { font-size: 14px; margin-bottom: 16px; }
+.checkout--embed .amount-hero { font-size: 34px; }
+.checkout--embed .qr-wrap { margin: 16px 0 6px; padding: 12px; }
+.checkout--embed .memo-note { margin: 14px 0; padding: 10px 12px; }
+.checkout--embed .status-rail { margin-top: 14px; }
+.checkout--embed .settled-check,
+.checkout--embed .status-icon,
+.checkout--embed .error-icon {
+  width: 40px;
+  height: 40px;
+  font-size: 20px;
+  margin-bottom: 8px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .spinner { animation: none; }
   .tl-dot.dot--pending { animation: none; }

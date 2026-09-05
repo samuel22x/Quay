@@ -59,7 +59,7 @@ export default async function PayPage({
         </header>
       )}
       <div className={isEmbed ? "panel panel--embed" : "panel"}>
-        <CheckoutClient initial={data} />
+        <CheckoutClient initial={data} embed={isEmbed} />
       </div>
     </main>
   );

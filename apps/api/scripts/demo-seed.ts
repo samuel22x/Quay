@@ -1,25 +1,29 @@
 #!/usr/bin/env tsx
 /**
- * scripts/demo-seed.ts
+ * apps/api/scripts/demo-seed.ts
  *
- * Populates the dashboard with real on-chain testnet data so a first-time
- * visitor sees a genuinely populated, paid, and cashed-out demo instead of an
- * empty screen.
+ * Populates the dashboard with real on-chain data so a first-time visitor
+ * sees a genuinely populated, paid, and cashed-out demo instead of an empty
+ * screen. Runs against whatever STELLAR_NETWORK the API itself is configured
+ * for (defaulting to testnet) — see the Config section below.
  *
  * What it does:
  *   1. Authenticates as the configured demo seller (SEP-10 login → session).
- *   2. Generates a fresh "buyer" keypair and funds it via Friendbot.
- *   3. Adds a USDC trustline on the buyer (testnet USDC only).
- *   4. Funds the buyer with testnet USDC via the testanchor /testnet/friendbot endpoint.
- *   5. Creates several payment links via POST /links (flagged isDemo:true).
+ *   2. Generates a fresh "buyer" keypair. On testnet, funds it via Friendbot;
+ *      on any other network, Friendbot doesn't exist, so this step is skipped
+ *      with a clear message instead of failing obscurely later.
+ *   3. Adds a USDC trustline on the buyer.
+ *   4. On testnet, funds the buyer with USDC via the testanchor dispenser.
+ *   5. Creates several payment links via POST /links (flagged isDemo:true),
+ *      including one with the fixed id the /demo storefront page links to.
  *   6. Submits real Stellar payments from the buyer to the seller using the
  *      correct memo for each link so the watcher can match them.
  *   7. Polls GET /links until the target links flip to "paid".
  *   8. Triggers POST /links/:id/cash-out on one paid link so the dashboard
  *      shows an offramp_settled row (mock off-ramp settles quickly).
  *
- * Invariant: every row written is real on-chain testnet data — nothing is
- * fabricated directly in the database.
+ * Invariant: every row written is real on-chain data — nothing is fabricated
+ * directly in the database.
  *
  * Auth: the script authenticates as the configured demo seller (SEP-10 login)
  * so the seeded links land under the same seller the dashboard already knows.
@@ -28,18 +32,22 @@
  * Usage:
  *   pnpm demo:seed                         # uses defaults from .env
  *   API_URL=http://localhost:8787 pnpm demo:seed
+ *
+ * This lives under apps/api/ (not the repo root) because it depends on
+ * @stellar/stellar-sdk — pnpm's strict node_modules layout means a script in
+ * the repo root cannot resolve it (see apps/api/scripts/gen-mainnet-secrets.mjs).
  */
 
 import {
   Keypair,
-  Networks,
   TransactionBuilder,
   Operation,
   Asset,
   BASE_FEE,
   Horizon,
 } from "@stellar/stellar-sdk";
-import { loadEnvFile, envValue } from "./lib/env";
+import { resolveStellarConfig, type StellarNetwork } from "@checkout/stellar";
+import { loadEnvFile, envValue, envValueOptional } from "./lib/env";
 import { loginAsSeller } from "./lib/sep10-login";
 
 // ---------------------------------------------------------------------------
@@ -48,16 +56,33 @@ import { loginAsSeller } from "./lib/sep10-login";
 
 const envFile = loadEnvFile();
 const API_URL = envValue(envFile, "API_URL", envValue(envFile, "NEXT_PUBLIC_API_URL", "http://localhost:8787"));
-const HORIZON_URL = envValue(envFile, "HORIZON_URL", "https://horizon-testnet.stellar.org");
-const USDC_ISSUER = envValue(envFile, "USDC_ISSUER_TESTNET", "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5");
+
+// Same network the API itself reads (apps/api/src/env.ts) — defaulting to
+// testnet, never hardcoded, so this script works against a mainnet or
+// self-hosted deployment too.
+const NETWORK = (envValueOptional(envFile, "STELLAR_NETWORK") ?? "testnet") as StellarNetwork;
+if (NETWORK !== "testnet" && NETWORK !== "public") {
+  throw new Error(`STELLAR_NETWORK must be "testnet" or "public", got "${NETWORK}"`);
+}
+const USDC_ISSUER =
+  NETWORK === "public"
+    ? envValue(envFile, "USDC_ISSUER_PUBLIC")
+    : envValue(envFile, "USDC_ISSUER_TESTNET", "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5");
+const stellar = resolveStellarConfig({
+  network: NETWORK,
+  horizonUrl: envValueOptional(envFile, "HORIZON_URL"),
+  usdcIssuer: USDC_ISSUER,
+});
+const HORIZON_URL = stellar.horizonUrl;
+const NETWORK_PASSPHRASE = stellar.networkPassphrase;
+
 // The seed script logs in as the demo seller (SEP-10) so links land under the
 // seller the dashboard already shows. Only a secret can sign the challenge.
 const DEFAULT_SELLER_SECRET = envValue(envFile, "DEFAULT_SELLER_SECRET");
-const NETWORK_PASSPHRASE = Networks.TESTNET;
+const IS_TESTNET = NETWORK === "testnet";
 const FRIENDBOT = "https://friendbot.stellar.org";
 // The testanchor hosts a USDC dispenser for testnet.
 const USDC_FRIENDBOT = "https://testanchor.stellar.org/testnet/friendbot";
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -176,7 +201,7 @@ interface LinkDef {
 }
 
 const LINK_DEFS: LinkDef[] = [
-  { title: "Demo — Invoice #1001 (ceramic mug ×2)", amount: "12.50", pay: true, cashOut: true },
+  { title: "Demo — Handcrafted Ceramic Mug",        amount: "25.00", pay: true, cashOut: true },
   { title: "Demo — SaaS subscription (monthly)",    amount: "49.00", pay: true },
   { title: "Demo — Freelance design retainer",      amount: "250.00", pay: false },
   { title: "Demo — E-book: Stellar for Developers", amount: "9.99",  pay: true },
@@ -201,11 +226,14 @@ async function main(): Promise<void> {
   console.log(`▶ Checking API at ${API_URL}…`);
   const health = await apiGet<{ ok: boolean; network: string; sellerWallet: string }>("/health");
   if (!health.ok) throw new Error("API health check failed");
-  if (health.network !== "testnet") {
-    throw new Error(`Demo seed only runs against testnet (got "${health.network}")`);
+  if (health.network !== NETWORK) {
+    throw new Error(
+      `This script is configured for STELLAR_NETWORK="${NETWORK}", but the API at ${API_URL} ` +
+      `is running "${health.network}". Point STELLAR_NETWORK/API_URL at the same deployment.`,
+    );
   }
   const sellerWallet = health.sellerWallet;
-  console.log(`  ✓ API ok  network=testnet  seller=${sellerWallet.slice(0, 8)}…\n`);
+  console.log(`  ✓ API ok  network=${NETWORK}  seller=${sellerWallet.slice(0, 8)}…\n`);
 
   // -- Authenticate as the demo seller (SEP-10) -------------------------------
   console.log("▶ Authenticating as demo seller via SEP-10…");
@@ -223,21 +251,37 @@ async function main(): Promise<void> {
   const server = new Horizon.Server(HORIZON_URL);
 
   // -- Fund buyer account via Friendbot ---------------------------------------
-  console.log("▶ Generating buyer keypair and funding via Friendbot…");
+  console.log("▶ Generating buyer keypair…");
   const buyer = Keypair.random();
   console.log(`  buyer: ${buyer.publicKey()}`);
-  await friendbot(buyer.publicKey());
-  console.log("  ✓ XLM funded");
+  if (IS_TESTNET) {
+    console.log("  funding via Friendbot…");
+    await friendbot(buyer.publicKey());
+    console.log("  ✓ XLM funded");
+  } else {
+    console.log(
+      `  [skip] Friendbot only exists on testnet — this is "${NETWORK}". Fund ${buyer.publicKey()} ` +
+      "with XLM (and USDC, below) yourself before the payment step, or it will fail with the " +
+      "real Horizon error (e.g. account not found) rather than silently.",
+    );
+  }
 
   // -- Add USDC trustlines ----------------------------------------------------
   console.log("\n▶ Adding USDC trustlines…");
   await addTrustline(server, buyer, USDC_ISSUER);
 
-  // -- Fund buyer with testnet USDC -------------------------------------------
-  console.log("\n▶ Requesting testnet USDC for buyer via testanchor friendbot…");
-  await usdcFriendbot(buyer.publicKey());
-  // Give Horizon a moment to see the USDC balance.
-  await sleep(3000);
+  // -- Fund buyer with USDC ---------------------------------------------------
+  if (IS_TESTNET) {
+    console.log("\n▶ Requesting testnet USDC for buyer via testanchor friendbot…");
+    await usdcFriendbot(buyer.publicKey());
+    // Give Horizon a moment to see the USDC balance.
+    await sleep(3000);
+  } else {
+    console.log(
+      `\n▶ [skip] The testanchor USDC dispenser only exists on testnet — fund ${buyer.publicKey()} ` +
+      "with USDC manually before the payment step below.",
+    );
+  }
   const buyerAcc = await server.loadAccount(buyer.publicKey());
   const usdcBalance = buyerAcc.balances.find(
     (b) =>
@@ -249,7 +293,7 @@ async function main(): Promise<void> {
   if (parseFloat(buyerUsdc) < 1) {
     console.warn(
       "  [warn] buyer has very little USDC. Paid links may fail.\n" +
-      "  To fund manually, send testnet USDC to:\n  " + buyer.publicKey(),
+      "  To fund manually, send USDC to:\n  " + buyer.publicKey(),
     );
   }
 

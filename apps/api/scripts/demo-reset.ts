@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * scripts/demo-reset.ts
+ * apps/api/scripts/demo-reset.ts
  *
  * Removes all rows flagged as demo data (is_demo = true) from the database
  * by calling POST /demo/reset on the local API.

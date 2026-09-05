@@ -577,7 +577,8 @@ function buildSvcWithHealth(health: AnchorHealth, offramp: OffRampPort): Svc {
         targetCurrency: typeof body.targetCurrency === "string" ? body.targetCurrency : "NGN",
         payoutFields: (body.payoutFields as Record<string, string> | undefined) ?? {},
       });
-      return ctx.json({ job, initiation }, 200);
+      const interactiveUrl = initiation.kind === "interactive" ? initiation.url : undefined;
+      return ctx.json({ job, interactiveUrl }, 200);
     } catch (err) {
       if (err instanceof Error && "status" in err) {
         return ctx.json(

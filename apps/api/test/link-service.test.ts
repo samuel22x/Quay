@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { OffRampJobNotFoundError, type KycPort, type RailPort } from "@checkout/core";
+import { OffRampJobNotFoundError, type KycPort, type OffRampInitiation, type RailPort } from "@checkout/core";
 import { MockAnchorOffRamp } from "@checkout/offramp";
 import type { StellarConfig } from "@checkout/stellar";
 import { LinkService } from "../src/services/link-service";
@@ -264,5 +264,77 @@ describe("LinkService + MockAnchorOffRamp — restart survives (integration)", (
 
     expect(links.get("lnk_1")?.status).toBe("offramp_settled");
     expect(links.get("lnk_1")?.offrampStatus).toBe("settled");
+  });
+});
+
+describe("LinkService.triggerCashOut — discriminated union return", () => {
+  it("moves link to offramp_pending for fields initiation arm", async () => {
+    const links = new FakeLinkRepository([makeLink({ status: "paid" })]);
+    const offrampState = new FakeOffRampStateRepository();
+    const offramp = new MockAnchorOffRamp({ state: offrampState });
+    const service = makeService({ links, offramp, offrampState });
+
+    const { job, initiation } = await service.triggerCashOut("lnk_1", { targetCurrency: "NGN", payoutFields: {} });
+
+    expect(initiation.kind).toBe("fields");
+    if (initiation.kind === "fields") {
+      expect(initiation.jobId).toBe(job.jobId);
+    }
+    expect(links.get("lnk_1")?.status).toBe("offramp_pending");
+  });
+
+  it("moves link to offramp_pending for interactive initiation arm", async () => {
+    const links = new FakeLinkRepository([makeLink({ status: "paid" })]);
+    const offrampState = new FakeOffRampStateRepository();
+    const offramp = new ScriptedOffRamp();
+    offramp.quoteImpl = async (input) => ({
+      quoteId: "q_1",
+      sourceAsset: input.sourceAsset,
+      sourceAmount: input.sourceAmount,
+      targetCurrency: input.targetCurrency,
+      targetAmount: "1650.00",
+      rate: "1650",
+      expiresAt: Date.now() + 60_000,
+      fee: { amount: "16.50", currency: input.targetCurrency, source: "anchor" },
+      netTargetAmount: "1633.50",
+    });
+    offramp.initiateImpl = async () => ({
+      kind: "interactive",
+      jobId: "job_interactive_123",
+      url: "https://anchor.example.com/interactive?id=job_interactive_123",
+    });
+
+    const service = makeService({ links, offramp, offrampState });
+    const { job, initiation } = await service.triggerCashOut("lnk_1", { targetCurrency: "NGN", payoutFields: {} });
+
+    expect(initiation.kind).toBe("interactive");
+    if (initiation.kind === "interactive") {
+      expect(initiation.url).toBe("https://anchor.example.com/interactive?id=job_interactive_123");
+      expect(initiation.jobId).toBe("job_interactive_123");
+    }
+    expect(job.jobId).toBe("job_interactive_123");
+    expect(links.get("lnk_1")?.status).toBe("offramp_pending");
+    expect(links.get("lnk_1")?.offrampJobId).toBe("job_interactive_123");
+  });
+});
+
+// The route flattens the union into `{ job, interactiveUrl? }` (issue 1.1
+// item 5). Pinning it here rather than only in the service: the flattening is
+// the public API contract a SEP-24 adapter and the dashboard both code
+// against, and `initiation.kind === "interactive" ? initiation.url : undefined`
+// is exactly the kind of line a later refactor gets subtly wrong.
+describe("cash-out response flattening", () => {
+  function flatten(initiation: OffRampInitiation): string | undefined {
+    return initiation.kind === "interactive" ? initiation.url : undefined;
+  }
+
+  it("omits interactiveUrl for a field-driven initiation", () => {
+    expect(flatten({ kind: "fields", jobId: "ofr_1" })).toBeUndefined();
+  });
+
+  it("surfaces the anchor url for an interactive initiation", () => {
+    expect(
+      flatten({ kind: "interactive", jobId: "ofr_1", url: "https://anchor.example.com/sep24" }),
+    ).toBe("https://anchor.example.com/sep24");
   });
 });

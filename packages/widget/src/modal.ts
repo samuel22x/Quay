@@ -1,16 +1,43 @@
 import type { QuayEventData, QuayEventHandler, QuayEventType, QuayOpenOptions } from "./types";
 
-const DEFAULT_HOST = "https://quay-web.vercel.app";
-
 const listeners = new Map<QuayEventType, Set<QuayEventHandler>>();
 
 let activeOverlay: HTMLElement | null = null;
 let activeIframe: HTMLIFrameElement | null = null;
 let activeLinkId: string | null = null;
-let activeHost: string = DEFAULT_HOST;
+// Always overwritten before use in openModal() - resolveHost() throws rather
+// than letting a call proceed with no host resolved (issue 5.10).
+let activeHost = "";
 let focusTrapHandler: ((e: KeyboardEvent) => void) | null = null;
 let postMessageHandler: ((e: MessageEvent) => void) | null = null;
 let lastFocusedElement: HTMLElement | null = null;
+
+/**
+ * Resolves which Quay deployment the checkout iframe should point at.
+ *
+ * Previously this fell back to `https://quay-web.vercel.app` (the
+ * maintainer's own deployment) when it couldn't be detected any other way -
+ * silently pointing a self-hoster's integration at someone else's backend
+ * is worse than failing loudly, since the failure mode there is a checkout
+ * that mysteriously doesn't match the merchant's own links, not an obvious
+ * error. There is deliberately no fallback host anymore: either the
+ * integrator passes `host` explicitly, or it's inferred from the actual
+ * `<script src="...widget.js">` tag that loaded this code - both are
+ * genuinely correct answers. Anything else throws.
+ */
+function resolveHost(explicitHost: string | undefined): string {
+  if (explicitHost) return explicitHost;
+
+  const scriptTag = document.querySelector<HTMLScriptElement>("script[src*='widget.js']");
+  if (scriptTag) return new URL(scriptTag.src, window.location.href).origin;
+
+  throw new Error(
+    "Quay widget: could not determine which Quay deployment to use. Pass `host` explicitly " +
+      '(e.g. Quay.open({ linkId, host: "https://your-quay-deployment.example.com" })), or make ' +
+      "sure the widget script tag's own src is reachable (script[src*='widget.js']) so it can be " +
+      "inferred automatically.",
+  );
+}
 
 function emit(type: QuayEventType, data: QuayEventData): void {
   const handlers = listeners.get(type);
@@ -61,10 +88,6 @@ export function closeModal(): void {
 }
 
 export function openModal(linkIdOrOpts: string | QuayOpenOptions, opts?: Partial<QuayOpenOptions>): void {
-  closeModal();
-
-  lastFocusedElement = document.activeElement as HTMLElement | null;
-
   let linkId: string;
   let options: QuayOpenOptions;
 
@@ -76,14 +99,21 @@ export function openModal(linkIdOrOpts: string | QuayOpenOptions, opts?: Partial
     options = linkIdOrOpts;
   }
 
+  // Resolved (and allowed to throw) before any state changes - a failed
+  // open() call because the host can't be determined should be a true
+  // no-op, not one that closes whatever modal was already open and leaves
+  // nothing in its place.
+  const resolvedHost = resolveHost(options.host);
+
+  closeModal();
+
+  lastFocusedElement = document.activeElement as HTMLElement | null;
+
   if (options.onPaid) addEventListener("quay:paid", options.onPaid);
   if (options.onClosed) addEventListener("quay:closed", options.onClosed);
   if (options.onError) addEventListener("quay:error", options.onError);
 
-  const scriptTag = document.querySelector<HTMLScriptElement>("script[src*='widget.js']");
-  const hostFromScript = scriptTag ? new URL(scriptTag.src, window.location.href).origin : null;
-  
-  activeHost = options.host || hostFromScript || (typeof window !== "undefined" ? window.location.origin : DEFAULT_HOST);
+  activeHost = resolvedHost;
   activeLinkId = linkId;
 
   // Create Modal Overlay

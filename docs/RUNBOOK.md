@@ -33,8 +33,9 @@ default.
 | `DATABASE_URL` · `DATABASE_AUTH_TOKEN` | always (prod) | No persistence; falls back to a local SQLite file inside the container, which is destroyed on every deploy |
 | `KYC_ENCRYPTION_KEY` | `OFFRAMP=testanchor` | **Process will not boot.** `env.ts` resolves it with `req()` at module load and throws `Missing required env var: KYC_ENCRYPTION_KEY` |
 | `WEBHOOK_SECRET_ENCRYPTION_KEY` | `NODE_ENV=production` | **Process will not boot** (`createContainer()` calls `assertKeyConfigured()`). Before that check existed, it fell back to a hardcoded public dev key and 500'd on the first webhook registration |
-| `JWT_SECRET` | `STELLAR_NETWORK=public`; strongly advised on testnet | Auto-generated per boot, so every restart and deploy logs every seller out |
-| `SERVER_SIGNING_SECRET` | `STELLAR_NETWORK=public`; strongly advised on testnet | Auto-generated per boot, so the `SIGNING_KEY` published in `stellar.toml` changes on every restart and any wallet that cached it breaks |
+| `JWT_SECRET` | `STELLAR_NETWORK=public`; strongly advised on testnet | **Process will not boot on public network** (`resolveJwtSecret()` in `apps/api/src/services/container.ts:512` throws). On testnet: auto-generated per boot, so every restart and deploy logs every seller out |
+| `SERVER_SIGNING_SECRET` | `STELLAR_NETWORK=public`; strongly advised on testnet | **Process will not boot on public network** (`resolveServerSigningKeypair()` in `apps/api/src/services/container.ts:489` throws). On testnet: auto-generated per boot, so the `SIGNING_KEY` published in `stellar.toml` changes on every restart and any wallet that cached it breaks |
+| `DEFAULT_SELLER_WALLET` | `STELLAR_NETWORK=public` | **Process will not boot on public network** (`resolveSellerKeypairOrWallet()` in `apps/api/src/services/container.ts:386` throws). On testnet: auto-generates a throwaway keypair and prints it (funds land in a key nobody kept across a restart) |
 | `HOME_DOMAIN` | any real deployment | Falls back to `localhost:8787`. SEP-10 challenges are issued for localhost and `stellar.toml` advertises `WEB_AUTH_ENDPOINT="https://localhost:8787/auth"` — **wallet login cannot work at all** |
 | `CORS_ORIGINS` | always | The browser refuses the dashboard's cross-origin calls |
 | `DEFAULT_SELLER_SECRET` | `OFFRAMP=testanchor` with `DEFAULT_SELLER_WALLET` set | SEP-10 cannot sign the anchor's auth challenge, so every cash-out fails |
@@ -50,7 +51,10 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 `render.yaml` declares all of these; the `sync: false` entries must be filled in
 from the Render dashboard on first deploy. Adding a new `req()` call to
 `apps/api/src/env.ts` without adding the matching `render.yaml` entry is what
-caused the 2026-07-31 outage — see `docs/FIXLOG.md` `BUG-4.11`.
+caused the 2026-07-31 outage — see `docs/FIXLOG.md` `BUG-4.11`. The same
+mistake is possible in `apps/api/src/services/container.ts`, where
+`DEFAULT_SELLER_WALLET` (line 386), `SERVER_SIGNING_SECRET` (line 489), and
+`JWT_SECRET` (line 512) are also enforced at boot on public network.
 
 ### Scaling past one instance
 
@@ -68,6 +72,136 @@ prerequisite, not a preference:
   in a per-process `Map`. The persisted replay table still works; only the
   concurrent-duplicate guard is lost, and it guards a money endpoint.
 
+## Mainnet: a second, separate service
+
+Everything below this point was originally written against the single testnet
+Render service (`quay-api`). After the mainnet cutover (`docs/MAINNET.md`)
+there are **two independent services with two independent sets of secrets**:
+
+| | Testnet (default below) | Mainnet |
+|---|---|---|
+| Render service name | `quay-api` | `quay-api-mainnet` |
+| Blueprint | `render.yaml` | `render.mainnet.yaml` |
+| `STELLAR_NETWORK` | `testnet` | `public` |
+| API URL | `https://quay-api.onrender.com` | the host Render assigns `quay-api-mainnet`, or your custom domain if `HOME_DOMAIN` is set — check the Render dashboard, do not assume it |
+| Database | testnet Turso DB | a **separate** Turso DB — never point both services at the same one |
+| Off-ramp | `testanchor` (SDF sandbox) | `anchor` (a real production anchor) or `none` |
+
+Rotating, redeploying, or restoring one has **no effect** on the other. A
+`DATABASE_URL` accidentally pointed at the wrong service's database is not a
+typo that fails loudly — it is real payment data landing in (or being
+overwritten by) the wrong environment.
+
+### What's shared vs. what's per-environment
+
+- **Shared** (same code path, same repo, just pointed at a different target):
+  the push-to-`main` deploy trigger, the `/ready`-gates-traffic contract, the
+  `pnpm db:restore` / `pnpm db:backup` scripts and backup file format, and the
+  incident template at the bottom of this document.
+- **Per-environment** (must be done once for *each* service, independently):
+  which secrets are set (`render.mainnet.yaml`'s own header comment lists
+  mainnet's full secret set — it includes `ANCHOR_URL` / `ANCHOR_HOME_DOMAIN` /
+  `METRICS_TOKEN`, which testnet's `render.yaml` does not declare), which
+  Render service's logs/deploys you are watching, and which backup file you
+  restore from (see Restore below — testnet and mainnet backups are not
+  interchangeable).
+
+### Deploy — mainnet
+
+Same push-to-`main` mechanism as the Deploy section below; Render rebuilds
+both services from the same commit. What differs:
+
+- Watch **`quay-api-mainnet`**'s own deploy logs for `/ready` — it is a
+  separate Render service from `quay-api` with a separate log stream.
+- The public-network guardrails in `apps/api/src/env.ts` throw at boot on a
+  bad mainnet config (wrong off-ramp mode, a missing secret, a plain-HTTP
+  anchor URL, and more — the full table is in `docs/MAINNET.md`). A mainnet
+  deploy that fails to go `/ready` is very often a guardrail doing exactly its
+  job, not a code regression — read the boot error before assuming otherwise.
+- Run `docs/MAINNET.md` Phase 5's verification checklist after **every**
+  mainnet deploy, not just the first — it is cheap, and it catches a wrong
+  `SIGNING_KEY` or a rejected wallet signature before a real customer does.
+
+### Rollback — mainnet
+
+The Rollback section below (redeploy the previous successful build) applies
+identically — just pick `quay-api-mainnet` in the Render dashboard instead of
+`quay-api`.
+
+To abandon a mainnet cutover entirely rather than roll back one bad deploy
+(e.g. cutover happened before the service was actually ready for traffic),
+follow `docs/MAINNET.md`'s own Rollback section instead: stop routing traffic
+to `quay-api-mainnet` and point the web app's `NEXT_PUBLIC_API_URL` (and
+`NEXT_PUBLIC_STELLAR_NETWORK`) back at testnet. Either way, payments already
+settled on the public ledger cannot be rolled back — only the service in front
+of them can be.
+
+### Restore — mainnet
+
+Same `pnpm db:restore` script and procedure as the Restore section below, with
+two things that must never be crossed:
+
+- **Restore only from a backup taken of `quay-api-mainnet`'s own database.**
+  Restoring a testnet backup into the mainnet database replaces real
+  payment/off-ramp/KYC rows with fake ones; restoring a mainnet backup into
+  testnet leaks real seller PII into a lower-trust environment.
+- Confirm whatever nightly backup job you set up for mainnet
+  (`docs/MAINNET.md`'s Database note) is actually pointed at the mainnet
+  `DATABASE_URL` *before* an incident, not while triaging one.
+
+The quarterly scratch-drill procedure and the restore-drill log below are
+shared — a drill exercises the backup/restore code path itself, which is
+identical for both environments.
+
+### Key rotation — mainnet
+
+Same procedures as the Key rotation section below, run against
+`quay-api-mainnet`'s own secret values — rotating a key on `quay-api`
+(testnet) never touches mainnet's copy of that key, and vice versa. Two
+mainnet-only notes:
+
+- **`ANCHOR_URL` / `ANCHOR_HOME_DOMAIN`** only exist on mainnet
+  (`OFFRAMP=anchor`). Changing anchors is not a rotation — treat it as picking
+  a new anchor (`docs/MAINNET.md` Phase 1) and re-verify its SEP-10/SEP-38/
+  SEP-6 support before pointing production traffic at it.
+- **`METRICS_TOKEN`** is `sync: false` on mainnet the same as testnet — rotate
+  it the same way, but remember any external scraper reading the mainnet
+  `/metrics` endpoint needs the new token too.
+
+## Uptime monitoring
+
+`scripts/uptime-check.mjs` (`.github/workflows/uptime.yml`) checks every
+configured environment on one schedule, each with its own history series and
+its own section in `docs/STATUS.md` — a healthy testnet can never stand in
+for an unmonitored mainnet (issue 8.8).
+
+**Testnet is always checked**, with the same defaults and unprefixed target
+ids (`api` / `web` / `synthetic`) this script has always used —
+`https://quay-api.onrender.com` / `https://quay-web.vercel.app`, overridable
+via `UPTIME_API_URL` / `UPTIME_WEB_URL`.
+
+**Mainnet is checked only once you configure it — there is no default of any
+kind.** Set these as repository **Variables** (Settings → Secrets and
+variables → Actions → Variables — they're plain hostnames, not secrets):
+
+| Variable | Required | What it does |
+|---|---|---|
+| `UPTIME_MAINNET_API_URL` | to watch mainnet at all | e.g. `https://quay-api-mainnet.onrender.com` (`render.mainnet.yaml`'s `quay-api-mainnet`). Unset means mainnet is skipped entirely, not silently checked against the testnet URL. |
+| `UPTIME_MAINNET_WEB_URL` | optional | Only set this if a dedicated mainnet web deployment exists. `render.mainnet.yaml` declares no web service today, so leave unset until one does. |
+| `UPTIME_MAINNET_SYNTHETIC_CHECK` | optional, default off | Set to `1` to also POST a throwaway `/links` synthetic check against mainnet, same as testnet already does. Left off by default: it would write a real row into the production database on every successful run, and unlike testnet, `POST /links` there has no scoped-credential story yet — see issue #163 (least-privilege API key for this check) before turning it on. |
+
+Once `UPTIME_MAINNET_API_URL` is set, the next run adds a `## Mainnet`
+section to `docs/STATUS.md` and starts filing incidents titled
+`🔴 Uptime: Mainnet — API is down` (the environment name is always in the
+title and body — see `renderStatusMd`/`buildTargets` in the script) instead of
+the ambiguous `🔴 Uptime: API is down` a pre-8.8 reader might mistake for
+testnet.
+
+**The scheduled run itself is still disabled** (`.github/workflows/uptime.yml`
+only has `workflow_dispatch`, no `schedule` — see `TODO.md` §5). Re-enabling
+it and setting the variables above are both owner actions: this doc only
+covers what to set once you do.
+
 ## Deploy
 
 Render deploys `apps/api` as a single always-on Docker web service (starter
@@ -79,7 +213,12 @@ app deploys separately to Vercel.
 1. Confirm `pnpm typecheck && pnpm test && pnpm build` is green on `main`
    (CI - `.github/workflows/ci.yml` - already gates this on every push/PR).
 2. Render picks up the new commit and rebuilds `apps/api/Dockerfile`.
-3. Watch the Render deploy logs for the health check (`/health`) to go green.
+3. Watch the Render deploy logs for the health check (`/ready`) to go green —
+   **not** `/health`. `render.yaml`/`render.mainnet.yaml`'s `healthCheckPath`
+   and the Dockerfile's own `HEALTHCHECK` both gate traffic on `/ready`, which
+   checks the database is actually reachable; `/health` is liveness-only and
+   returns `ok: true` unconditionally, so watching it go green tells you the
+   process started, not that it can serve a request.
 4. Confirm the watcher loop resumed: check for `payment ... ->` log lines, or
    query `watcher_cursors` for a recent `updated_at` on a watched account.
 

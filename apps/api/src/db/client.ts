@@ -32,14 +32,20 @@ const BOOTSTRAP_SQL = [
      expires_at INTEGER, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
    )`,
   // Cumulative payment ledger (issue 1.4) — one row per payment ever recorded
-  // against a link, `tx_hash` unique so a reprocessed payment can't double-count.
+  // against a link. Unique on (tx_hash, operation_id), not tx_hash alone
+  // (issue 4.11): a transaction can carry more than one payment operation to
+  // the same link, and each must land its own row rather than being dropped
+  // as a false duplicate of the other.
   `CREATE TABLE IF NOT EXISTS link_payments (
-     id TEXT PRIMARY KEY, link_id TEXT NOT NULL, tx_hash TEXT NOT NULL UNIQUE,
+     id TEXT PRIMARY KEY, link_id TEXT NOT NULL, tx_hash TEXT NOT NULL,
+     operation_id TEXT,
      payer TEXT NOT NULL, amount TEXT NOT NULL,
      asset_code TEXT NOT NULL, asset_issuer TEXT, ledger INTEGER,
      created_at INTEGER NOT NULL
    )`,
   `CREATE INDEX IF NOT EXISTS link_payments_link_id_idx ON link_payments (link_id)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS link_payments_tx_hash_operation_id_unique
+     ON link_payments (tx_hash, operation_id)`,
   `CREATE TABLE IF NOT EXISTS webhooks (
      id TEXT PRIMARY KEY, seller_id TEXT NOT NULL, url TEXT NOT NULL,
      secret_encrypted TEXT NOT NULL, secret_last4 TEXT NOT NULL,
@@ -54,6 +60,8 @@ const BOOTSTRAP_SQL = [
      status_code INTEGER, ok INTEGER NOT NULL,
      error TEXT, created_at INTEGER NOT NULL
    )`,
+  `CREATE INDEX IF NOT EXISTS webhook_deliveries_webhook_id_created_at_idx
+     ON webhook_deliveries (webhook_id, created_at DESC)`,
   `CREATE TABLE IF NOT EXISTS webhook_queue (
      id TEXT PRIMARY KEY,
      webhook_id TEXT NOT NULL,
@@ -91,9 +99,16 @@ const BOOTSTRAP_SQL = [
   `CREATE TABLE IF NOT EXISTS watcher_cursors (
      account TEXT PRIMARY KEY, cursor TEXT NOT NULL, updated_at INTEGER NOT NULL
    )`,
+  // Watcher dedup ledger (issue 4.11). Keyed on (tx_hash, operation_id), not
+  // tx_hash alone: a transaction can carry more than one payment operation,
+  // and each must dedupe independently. operation_id NULL (only possible via
+  // migrateLegacyProcessedTxTable, never written by new code) means "the
+  // whole transaction", preserving old behavior for pre-migration rows.
   `CREATE TABLE IF NOT EXISTS processed_tx (
-     tx_hash TEXT PRIMARY KEY, link_id TEXT, created_at INTEGER NOT NULL
+     tx_hash TEXT NOT NULL, operation_id TEXT, link_id TEXT, created_at INTEGER NOT NULL,
+     PRIMARY KEY (tx_hash, operation_id)
    )`,
+  `CREATE INDEX IF NOT EXISTS processed_tx_tx_hash_idx ON processed_tx (tx_hash)`,
   `CREATE TABLE IF NOT EXISTS idempotency_keys (
      key TEXT NOT NULL, seller_id TEXT NOT NULL, endpoint TEXT NOT NULL,
      request_hash TEXT NOT NULL, response_status INTEGER NOT NULL,
@@ -223,8 +238,81 @@ async function migrateLegacyWebhooksTable(client: Client): Promise<void> {
   }
 }
 
+/**
+ * Rebuilds `processed_tx` around (tx_hash, operation_id) instead of tx_hash
+ * alone (issue 4.11). SQLite can't ALTER a column into/out of a PRIMARY KEY,
+ * and the whole point here is that tx_hash must stop being unique by itself —
+ * two payment operations sharing one transaction need two rows — so this is a
+ * rename/recreate/copy/drop, not an ADD COLUMN. Legacy rows get
+ * operation_id = NULL, which `DrizzleWatcherStateRepository.isProcessed`
+ * treats as "the whole transaction was processed", preserving exactly the
+ * dedup behavior anything already settled before this migration runs had.
+ *
+ * No-op on a fresh database (BOOTSTRAP_SQL below creates the current shape
+ * directly) and on a database already migrated.
+ */
+async function migrateLegacyProcessedTxTable(client: Client): Promise<void> {
+  const info = await client.execute("PRAGMA table_info(processed_tx)");
+  const columns = new Set(info.rows.map((r) => String(r.name)));
+  if (columns.size === 0 || columns.has("operation_id")) return; // fresh table, or already migrated
+
+  await client.execute("ALTER TABLE processed_tx RENAME TO processed_tx_legacy_4_11");
+  await client.execute(`CREATE TABLE processed_tx (
+     tx_hash TEXT NOT NULL, operation_id TEXT, link_id TEXT, created_at INTEGER NOT NULL,
+     PRIMARY KEY (tx_hash, operation_id)
+   )`);
+  await client.execute("CREATE INDEX IF NOT EXISTS processed_tx_tx_hash_idx ON processed_tx (tx_hash)");
+  await client.execute(
+    `INSERT INTO processed_tx (tx_hash, operation_id, link_id, created_at)
+     SELECT tx_hash, NULL, link_id, created_at FROM processed_tx_legacy_4_11`,
+  );
+  await client.execute("DROP TABLE processed_tx_legacy_4_11");
+}
+
+/**
+ * Same rebuild as `migrateLegacyProcessedTxTable`, for `link_payments` (issue
+ * 4.11): the unique constraint moves from tx_hash alone to
+ * (tx_hash, operation_id), so a split payment's second operation gets its own
+ * ledger row instead of being silently dropped by `onConflictDoNothing`.
+ * Legacy rows get operation_id = NULL; unlike processed_tx, nothing reads
+ * link_payments as a dedup gate, so NULL there carries no special meaning —
+ * it just fills the new column on rows written before it existed.
+ */
+async function migrateLegacyLinkPaymentsTable(client: Client): Promise<void> {
+  const info = await client.execute("PRAGMA table_info(link_payments)");
+  const columns = new Set(info.rows.map((r) => String(r.name)));
+  if (columns.size === 0 || columns.has("operation_id")) return; // fresh table, or already migrated
+
+  // `ledger` (issue 9.2) may or may not be present yet depending on how old
+  // this particular database is — don't assume either way, select it if it's
+  // there and NULL otherwise, same as `operation_id` always being NULL here.
+  const ledgerSelect = columns.has("ledger") ? "ledger" : "NULL";
+
+  await client.execute("ALTER TABLE link_payments RENAME TO link_payments_legacy_4_11");
+  await client.execute(`CREATE TABLE link_payments (
+     id TEXT PRIMARY KEY, link_id TEXT NOT NULL, tx_hash TEXT NOT NULL,
+     operation_id TEXT,
+     payer TEXT NOT NULL, amount TEXT NOT NULL,
+     asset_code TEXT NOT NULL, asset_issuer TEXT, ledger INTEGER,
+     created_at INTEGER NOT NULL
+   )`);
+  await client.execute("CREATE INDEX IF NOT EXISTS link_payments_link_id_idx ON link_payments (link_id)");
+  await client.execute(
+    `CREATE UNIQUE INDEX IF NOT EXISTS link_payments_tx_hash_operation_id_unique
+       ON link_payments (tx_hash, operation_id)`,
+  );
+  await client.execute(
+    `INSERT INTO link_payments (id, link_id, tx_hash, operation_id, payer, amount, asset_code, asset_issuer, ledger, created_at)
+     SELECT id, link_id, tx_hash, NULL, payer, amount, asset_code, asset_issuer, ${ledgerSelect}, created_at
+     FROM link_payments_legacy_4_11`,
+  );
+  await client.execute("DROP TABLE link_payments_legacy_4_11");
+}
+
 export async function bootstrap(client: Client): Promise<void> {
   await migrateLegacyWebhooksTable(client);
+  await migrateLegacyProcessedTxTable(client);
+  await migrateLegacyLinkPaymentsTable(client);
   for (const sql of BOOTSTRAP_SQL) {
     try {
       await client.execute(sql);

@@ -26,6 +26,17 @@ jobs:
 
       - name: Run checks
         id: uptime
+        env:
+          # Least-privilege API keys for the synthetic write check (issue
+          # 8.9). Secrets, not vars — these authenticate a write.
+          UPTIME_API_KEY: ${{ secrets.UPTIME_API_KEY }}
+          UPTIME_MAINNET_API_KEY: ${{ secrets.UPTIME_MAINNET_API_KEY }}
+          # Mainnet is only checked once this is actually set — see
+          # docs/RUNBOOK.md "Uptime monitoring". No default: an unset value
+          # here must mean "not configured", never "check testnet again".
+          UPTIME_MAINNET_API_URL: ${{ vars.UPTIME_MAINNET_API_URL }}
+          UPTIME_MAINNET_WEB_URL: ${{ vars.UPTIME_MAINNET_WEB_URL }}
+          UPTIME_MAINNET_SYNTHETIC_CHECK: ${{ vars.UPTIME_MAINNET_SYNTHETIC_CHECK }}
         run: |
           node scripts/uptime-check.mjs | tee /tmp/uptime.log
           {

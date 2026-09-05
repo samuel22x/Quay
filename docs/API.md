@@ -498,9 +498,17 @@ settled.
     "targetCurrency": "NGN",
     "targetAmount": "17325.00",
     "rate": "1650"
-  }
+  },
+  "interactiveUrl": "https://anchor.example.com/sep24/interactive?id=..."
 }
 ```
+- `interactiveUrl` — **present only when the anchor requires the seller in a
+  browser** (SEP-24). Absent for field-driven anchors (SEP-6), which is every
+  adapter shipped today. When present, open it and keep polling `status()`
+  exactly as before — the link is already `offramp_pending` either way, so the
+  field is additive and a client that ignores it behaves as it did previously.
+  It is always `https`; the dashboard refuses any other scheme.
+
 **409** — link is not in `paid` state: `{ "error": "Link must be paid to cash out (is \"pending\")" }`
 **404** — `{ "error": "Link not found" }`
 **403** — `{ "error": "kyc_required" }`. Only possible with `OFFRAMP=testanchor`: the

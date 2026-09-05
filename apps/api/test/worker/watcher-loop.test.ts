@@ -6,6 +6,7 @@ import type { DrizzleLinkRepository, DrizzleSellerRepository, DrizzleWebhookRepo
 import { DrizzleOffRampStateRepository } from "../../src/repos/index";
 import { NoKycRequired } from "@checkout/offramp";
 import { FakeTelemetryRepository } from "../fakes";
+import type { NormalizedPayment, WatcherPort } from "@checkout/core";
 
 // ---------------------------------------------------------------------------
 //  WatcherLoop tests
@@ -150,7 +151,7 @@ describe("WatcherLoop", () => {
       const ref = "idem_ref_1";
       await createActiveLink(ref);
       const txHash = "tx_idem_1";
-      await stateRepo.markProcessed(txHash, null);
+      await stateRepo.markProcessed(txHash, "400", null);
       await stateRepo.setCursor(DEST, "399");
 
       watcher.setPayments([
@@ -248,7 +249,7 @@ describe("WatcherLoop", () => {
 
       await loop.runOnce();
 
-      const processed = await stateRepo.isProcessed("tx_crash_1");
+      const processed = await stateRepo.isProcessed("tx_crash_1", "801");
       expect(processed).toBe(true);
 
       const cursor = await stateRepo.getCursor(DEST);
@@ -260,7 +261,7 @@ describe("WatcherLoop", () => {
       await createActiveLink(ref);
       const txHash = "tx_crash_2";
 
-      await stateRepo.markProcessed(txHash, `lnk_${ref}`);
+      await stateRepo.markProcessed(txHash, "901", `lnk_${ref}`);
       await stateRepo.setCursor(DEST, "900");
 
       watcher.setPayments([
@@ -344,7 +345,7 @@ describe("WatcherLoop", () => {
 
       await loop.runOnce();
 
-      const processed = await stateRepo.isProcessed("tx_unknown_1");
+      const processed = await stateRepo.isProcessed("tx_unknown_1", "1201");
       expect(processed).toBe(true);
     });
   });
@@ -450,6 +451,186 @@ describe("WatcherLoop — crash between markProcessed and setCursor", () => {
     link = await repos.links.findByReference(ref);
     expect(link!.status).toBe("paid");
     expect(link!.paidAmount).toBe("10");
+
+    await repos.client.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+//  Operation-level dedup (issue 4.11)
+//
+//  A Stellar transaction can carry up to 100 operations, and a payment is one
+//  operation, not the whole transaction. The old `processed_tx` (and
+//  `link_payments`) dedup keyed on tx_hash alone, so a second payment
+//  operation sharing a transaction with the first was discarded as a false
+//  duplicate — permanently: there's no re-processing path once a hash is
+//  marked done.
+// ---------------------------------------------------------------------------
+
+/** Routes scripted payments per destination, unlike `FakeWatcherPort` (whose
+ *  single shared queue would hand every payment to whichever account's tick
+ *  asks first) — needed to exercise two destinations settling within the
+ *  same `runOnce()`. */
+class RoutedFakeWatcherPort implements WatcherPort {
+  private byAccount = new Map<string, NormalizedPayment[]>();
+
+  setPaymentsFor(account: string, payments: NormalizedPayment[]): void {
+    this.byAccount.set(account, payments);
+  }
+
+  async latestCursor(_account: string): Promise<string | null> {
+    return "100";
+  }
+
+  async fetchSince(account: string, _cursor: string, _limit?: number): Promise<NormalizedPayment[]> {
+    const result = this.byAccount.get(account) ?? [];
+    this.byAccount.set(account, []);
+    return result;
+  }
+}
+
+describe("WatcherLoop — operation-level dedup (issue 4.11)", () => {
+  it("a two-operation transaction paying one link settles it at the full amount", async () => {
+    const repos = await withTestDb();
+    const watcher = new FakeWatcherPort();
+    const rail = new FakeRailPort();
+    const offramp = new FakeOffRampPort();
+
+    const service = new LinkService({
+      links: repos.links,
+      sellers: repos.sellers,
+      webhooks: repos.webhooks,
+      rail,
+      offramp,
+      offrampState: new DrizzleOffRampStateRepository(repos.db),
+      kyc: new NoKycRequired(),
+      stellar: testStellarConfig,
+      telemetry: new FakeTelemetryRepository(),
+      correlation: "memo",
+      webhookGuard: async () => ({ ok: true }) as const,
+    });
+
+    const ref = "split_ref_1";
+    const seller = await repos.sellers.getDefault();
+    await repos.links.create({
+      id: `lnk_${ref}`,
+      reference: ref,
+      sellerId: seller.id,
+      destination: DEST,
+      muxedId: null,
+      title: "Split payment",
+      amount: "10",
+      asset: { code: "USDC", issuer: ISSUER },
+      expiresAt: null,
+    });
+
+    await repos.state.setCursor(DEST, "2000");
+
+    // A wallet splitting one payment across two operations in one atomic
+    // transaction: same tx_hash, two distinct pagingTokens (Horizon's own
+    // per-operation id).
+    const txHash = "tx_split_1";
+    watcher.setPayments([
+      FakeWatcherPort.payment({ txHash, pagingToken: "2001", memo: ref, amount: "6" }),
+      FakeWatcherPort.payment({ txHash, pagingToken: "2002", memo: ref, amount: "4" }),
+    ]);
+
+    const loop = new WatcherLoop({
+      watcher,
+      links: repos.links,
+      state: repos.state,
+      service,
+      pollMs: 60_000,
+    });
+    await loop.runOnce();
+
+    const link = await repos.links.findByReference(ref);
+    expect(link!.status).toBe("paid");
+    expect(link!.paidAmount).toBe("10"); // both operations credited, not just the first
+
+    // Each operation dedupes independently by its own pagingToken, not by the
+    // shared tx_hash — replaying either one alone is still recognized as
+    // already processed.
+    expect(await repos.state.isProcessed(txHash, "2001")).toBe(true);
+    expect(await repos.state.isProcessed(txHash, "2002")).toBe(true);
+
+    await repos.client.close();
+  });
+
+  it("one transaction paying two different sellers' destinations settles both links", async () => {
+    const repos = await withTestDb();
+    const watcher = new RoutedFakeWatcherPort();
+    const rail = new FakeRailPort();
+    const offramp = new FakeOffRampPort();
+
+    const service = new LinkService({
+      links: repos.links,
+      sellers: repos.sellers,
+      webhooks: repos.webhooks,
+      rail,
+      offramp,
+      offrampState: new DrizzleOffRampStateRepository(repos.db),
+      kyc: new NoKycRequired(),
+      stellar: testStellarConfig,
+      telemetry: new FakeTelemetryRepository(),
+      correlation: "memo",
+      webhookGuard: async () => ({ ok: true }) as const,
+    });
+
+    const seller = await repos.sellers.getDefault();
+    const DEST_B = "GDESTBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+
+    await repos.links.create({
+      id: "lnk_multi_a",
+      reference: "multi_ref_a",
+      sellerId: seller.id,
+      destination: DEST,
+      muxedId: null,
+      title: "Batched payout — seller A",
+      amount: "10",
+      asset: { code: "USDC", issuer: ISSUER },
+      expiresAt: null,
+    });
+    await repos.links.create({
+      id: "lnk_multi_b",
+      reference: "multi_ref_b",
+      sellerId: seller.id,
+      destination: DEST_B,
+      muxedId: null,
+      title: "Batched payout — seller B",
+      amount: "20",
+      asset: { code: "USDC", issuer: ISSUER },
+      expiresAt: null,
+    });
+
+    await repos.state.setCursor(DEST, "3000");
+    await repos.state.setCursor(DEST_B, "3000");
+
+    // Ordinary fee-saving batching: one transaction, two operations, two
+    // different watched destinations — same tx_hash both times.
+    const txHash = "tx_batch_1";
+    watcher.setPaymentsFor(DEST, [
+      FakeWatcherPort.payment({ txHash, pagingToken: "3001", to: DEST, memo: "multi_ref_a", amount: "10" }),
+    ]);
+    watcher.setPaymentsFor(DEST_B, [
+      FakeWatcherPort.payment({ txHash, pagingToken: "3002", to: DEST_B, memo: "multi_ref_b", amount: "20" }),
+    ]);
+
+    const loop = new WatcherLoop({
+      watcher,
+      links: repos.links,
+      state: repos.state,
+      service,
+      pollMs: 60_000,
+    });
+    await loop.runOnce();
+
+    const linkA = await repos.links.findByReference("multi_ref_a");
+    const linkB = await repos.links.findByReference("multi_ref_b");
+    // Old bug: whichever destination's tick reached the hash first claimed it
+    // system-wide, so the other seller's operation was invisibly dropped.
+    expect(linkA!.status).toBe("paid");
+    expect(linkB!.status).toBe("paid");
 
     await repos.client.close();
   });

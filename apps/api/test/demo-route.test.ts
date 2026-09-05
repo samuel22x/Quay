@@ -6,7 +6,10 @@ import { demoRoutes } from "../src/routes/demo";
 
 const seller: Seller = { id: "sel_1", name: "Demo Seller", wallet: "GSELLER", payoutFields: null, createdAt: Date.now() };
 
-function fakeContainer(deleteDemo: (sellerId?: string) => Promise<number>): Container {
+function fakeContainer(
+  deleteDemo: (sellerId?: string) => Promise<number>,
+  findDemo: () => Promise<{ id: string } | null> = async () => null,
+): Container {
   const sellers: SellerRepository = {
     getDefault: async () => seller,
     findById: async (id) => (id === seller.id ? seller : null),
@@ -24,7 +27,7 @@ function fakeContainer(deleteDemo: (sellerId?: string) => Promise<number>): Cont
   return {
     service: {} as Container["service"],
     logger: NOOP_LOGGER,
-    links: { deleteDemo } as unknown as Container["links"],
+    links: { deleteDemo, findDemo } as unknown as Container["links"],
     sellers: sellers as unknown as Container["sellers"],
     webhooks: {} as Container["webhooks"],
     apiKeys: {} as Container["apiKeys"],
@@ -81,6 +84,26 @@ describe("demoRoutes", () => {
     });
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, deleted: 5 });
+  });
+
+  // Regression: the /demo page hardcoded data-quay-link="demo_mug_123", an id
+  // the seed script never creates, so the widget button always 404'd. The page
+  // now reads the real id from here — an endpoint that has to exist for the
+  // button to render at all.
+  it("returns the seeded demo link id, unauthenticated", async () => {
+    const app = demoRoutes(fakeContainer(async () => 0, async () => ({ id: "lnk_demo_1" })));
+    const res = await app.request("/link");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ linkId: "lnk_demo_1" });
+  });
+
+  it("returns linkId: null when the demo has not been seeded", async () => {
+    const app = demoRoutes(fakeContainer(async () => 0, async () => null));
+    const res = await app.request("/link");
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ linkId: null });
   });
 
   // Regression, BUG-4.12. requireSeller only proves the caller is *a* seller,
