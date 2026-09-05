@@ -177,6 +177,9 @@ class FakeSellerRepo {
 class FakeWebhookRepo implements WebhookRepository {
   stored: Webhook[] = [];
   deliveries: WebhookDelivery[] = [];
+  /** Rows LinkService enqueued. Emission is now durable, so this — not a
+   *  captured fetch — is where an event first becomes observable. */
+  queued: { event: string; payload: string }[] = [];
   async create(input: { sellerId: string; url: string; secret: string }): Promise<Webhook> {
     const w: Webhook = {
       id: "whk_1",
@@ -193,11 +196,31 @@ class FakeWebhookRepo implements WebhookRepository {
     this.stored.push(w);
     return w;
   }
+  async getById(): Promise<null> {
+    return null;
+  }
+  async rotateSecret(): Promise<null> {
+    return null;
+  }
+  async softDelete(): Promise<boolean> {
+    return false;
+  }
+  async listDeliveries(): Promise<{ deliveries: never[]; nextCursor: null }> {
+    return { deliveries: [], nextCursor: null };
+  }
+  async reclaimStale(): Promise<number> {
+    return 0;
+  }
+  async countPending(): Promise<number> {
+    return 0;
+  }
   async findWebhookById(): Promise<null> {
     return null;
   }
   async enqueue(e: { id: string; webhookId: string; linkId: string; event: string; payload: string; nextAttemptAt: number; createdAt: number }) {
-    return { ...e, attempts: 0, status: "pending" as const, lastStatusCode: null, lastError: null, updatedAt: e.createdAt };
+    const row = { ...e, attempts: 0, status: "pending" as const, lastStatusCode: null, lastError: null, updatedAt: e.createdAt };
+    this.queued.push(row);
+    return row;
   }
   async claimDue(): Promise<never[]> {
     return [];
@@ -287,9 +310,20 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+/**
+ * Events the service emitted. Since the durable queue landed, `fireWebhook`
+ * writes a queue row and returns — delivery is the worker's job — so the
+ * assertion point moved from "what was POSTed" to "what was enqueued".
+ */
 function events(): { event: string; data: Record<string, unknown> }[] {
-  return captured.map((c) => ({ event: String(c.body.event ?? ""), data: (c.body.data as Record<string, unknown>) ?? {} }));
+  return (enqueuedBy?.queued ?? []).map((row) => {
+    const body = JSON.parse(row.payload) as Record<string, unknown>;
+    return { event: String(body.event ?? ""), data: (body.data as Record<string, unknown>) ?? {} };
+  });
 }
+
+/** Set by makeFixture so `events()` can reach the fixture's webhook repo. */
+let enqueuedBy: FakeWebhookRepo | undefined;
 
 // ---------- service fixture ---------------------------------------------------
 
@@ -304,6 +338,7 @@ interface Fixture {
 async function makeFixture(): Promise<Fixture> {
   const repo = new FakeLinkRepo();
   const hooks = new FakeWebhookRepo();
+  enqueuedBy = hooks;
   // Always register at least one hook so LinkService will actually dispatch.
   await hooks.create({ sellerId: "s_1", url: "https://example.com/h", secret: "test-secret" });
   const sellers = new FakeSellerRepo({
@@ -375,10 +410,10 @@ describe("LinkService.cancelLink", () => {
 
   it("IS idempotent: cancelling an already-cancelled link returns the link unchanged", async () => {
     await f.repo.save(link({ status: "cancelled" }));
-    const before = captured.length;
+    const before = events().length;
     const out = await f.service.cancelLink("lnk_1");
     expect(out.status).toBe("cancelled");
-    expect(captured.length).toBe(before);
+    expect(events().length).toBe(before);
   });
 
   it("REJECTS 409 when payment already settled (paid)", async () => {
@@ -446,18 +481,18 @@ describe("LinkService.sweepExpired", () => {
     for (const status of ["paid", "offramp_pending", "offramp_settled", "offramp_failed", "cancelled", "expired"] as AnyStatus[]) {
       await f.repo.save(link({ id: `lnk_${status}`, status, expiresAt: past - 10 }));
     }
-    const before = captured.length;
+    const before = events().length;
     const moved = await f.service.sweepExpired(now);
     expect(moved).toBe(0);
-    expect(captured.length).toBe(before); // no new events
+    expect(events().length).toBe(before); // no new events
   });
 
   it("returns 0 and emits no webhook when there is nothing to do", async () => {
     await f.repo.save(link({ expiresAt: null }));
-    const before = captured.length;
+    const before = events().length;
     const moved = await f.service.sweepExpired(Date.now());
     expect(moved).toBe(0);
-    expect(captured.length).toBe(before);
+    expect(events().length).toBe(before);
   });
 
   it("webhook payload includes the prior expiresAt so the seller can audit", async () => {

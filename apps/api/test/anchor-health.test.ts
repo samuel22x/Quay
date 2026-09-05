@@ -411,6 +411,12 @@ class FakeWebhookRepoForAnchor implements WebhookRepository {
   async softDelete(): Promise<boolean> {
     return false;
   }
+  async reclaimStale(): Promise<number> {
+    return 0;
+  }
+  async countPending(): Promise<number> {
+    return 0;
+  }
   async findWebhookById(): Promise<null> {
     return null;
   }

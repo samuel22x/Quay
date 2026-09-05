@@ -576,6 +576,23 @@ export class DrizzleWebhookRepository implements WebhookRepository {
       .where(eq(webhookQueue.id, id));
   }
 
+  async reclaimStale(claimedBefore: number): Promise<number> {
+    const released = await this.db
+      .update(webhookQueue)
+      .set({ status: "pending", updatedAt: Date.now() })
+      .where(and(eq(webhookQueue.status, "claimed"), lt(webhookQueue.updatedAt, claimedBefore)))
+      .returning();
+    return released.length;
+  }
+
+  async countPending(): Promise<number> {
+    const rows = await this.db
+      .select({ id: webhookQueue.id })
+      .from(webhookQueue)
+      .where(inArray(webhookQueue.status, ["pending", "claimed"]));
+    return rows.length;
+  }
+
   async findQueueEntry(id: string): Promise<WebhookQueueEntry | null> {
     const rows = await this.db
       .select()

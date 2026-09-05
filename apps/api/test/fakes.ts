@@ -23,6 +23,7 @@ import {
   type StoredOffRampQuote,
   type Webhook,
   type WebhookDelivery,
+  type WebhookQueueEntry,
   type WebhookRepository,
 } from "@checkout/core";
 import { encryptSecret } from "../src/services/secret-crypto";
@@ -173,6 +174,8 @@ export class FakeLinkRepository implements LinkRepository {
 
 export class FakeWebhookRepository implements WebhookRepository {
   readonly deliveries: WebhookDelivery[] = [];
+  /** Exposed so queue tests can assert on row state directly. */
+  readonly queue: WebhookQueueEntry[] = [];
   private readonly hooks: Webhook[] = [];
 
   async create(input: { sellerId: string; url: string; secret: string }): Promise<Webhook> {
@@ -192,28 +195,65 @@ export class FakeWebhookRepository implements WebhookRepository {
     return hook;
   }
 
-  async findWebhookById(): Promise<null> {
-
-    return null;
-
+  async findWebhookById(id: string): Promise<Webhook | null> {
+    return this.hooks.find((h) => h.id === id) ?? null;
   }
 
-  async enqueue(e: { id: string; webhookId: string; linkId: string; event: string; payload: string; nextAttemptAt: number; createdAt: number }) {
-    return { ...e, attempts: 0, status: "pending" as const, lastStatusCode: null, lastError: null, updatedAt: e.createdAt };
+  async enqueue(
+    e: Omit<WebhookQueueEntry, "attempts" | "status" | "lastStatusCode" | "lastError" | "updatedAt">,
+  ): Promise<WebhookQueueEntry> {
+    const row: WebhookQueueEntry = {
+      ...e,
+      attempts: 0,
+      status: "pending",
+      lastStatusCode: null,
+      lastError: null,
+      updatedAt: e.createdAt,
+    };
+    this.queue.push(row);
+    return row;
   }
 
-  async claimDue(): Promise<never[]> {
-
-    return [];
-
+  /** Mirrors the Drizzle claim: only rows this call transitions are returned. */
+  async claimDue(now: number, limit: number): Promise<WebhookQueueEntry[]> {
+    const claimed: WebhookQueueEntry[] = [];
+    for (const row of this.queue) {
+      if (claimed.length >= limit) break;
+      if (row.status !== "pending" || row.nextAttemptAt > now) continue;
+      row.status = "claimed";
+      row.updatedAt = Date.now();
+      claimed.push({ ...row });
+    }
+    return claimed;
   }
 
-  async updateQueueEntry(): Promise<void> {}
+  async updateQueueEntry(
+    id: string,
+    patch: Pick<WebhookQueueEntry, "status" | "attempts" | "nextAttemptAt" | "lastStatusCode" | "lastError">,
+  ): Promise<void> {
+    const row = this.queue.find((r) => r.id === id);
+    if (!row) return;
+    Object.assign(row, patch, { updatedAt: Date.now() });
+  }
 
-  async findQueueEntry(): Promise<null> {
+  async findQueueEntry(id: string): Promise<WebhookQueueEntry | null> {
+    const row = this.queue.find((r) => r.id === id);
+    return row ? { ...row } : null;
+  }
 
-    return null;
+  async reclaimStale(claimedBefore: number): Promise<number> {
+    let released = 0;
+    for (const row of this.queue) {
+      if (row.status !== "claimed" || row.updatedAt >= claimedBefore) continue;
+      row.status = "pending";
+      row.updatedAt = Date.now();
+      released += 1;
+    }
+    return released;
+  }
 
+  async countPending(): Promise<number> {
+    return this.queue.filter((r) => r.status === "pending" || r.status === "claimed").length;
   }
 
   async listDeliveriesByLinkId(linkId: string): Promise<WebhookDelivery[]> {

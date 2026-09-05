@@ -125,10 +125,18 @@ export function webhookRoutes(c: Container): Hono<{ Variables: AuthVariables }> 
    *   - claimed   → 409 (delivery is in-flight; wait for it to settle first)
    */
   app.post("/deliveries/:id/replay", async (ctx) => {
+    const seller = ctx.get("seller");
     const id = ctx.req.param("id");
     const entry = await c.webhooks.findQueueEntry(id);
 
-    if (!entry) {
+    // Ownership: the queue entry names a webhook, and the webhook names a
+    // seller. Resolving through getById scopes the replay to the caller's own
+    // tenant — without it, any authenticated seller could re-fire another
+    // merchant's events by guessing an id. A queue entry the caller does not
+    // own is reported as absent, so the endpoint leaks no id space either.
+    const owned = entry ? await c.webhooks.getById(entry.webhookId, seller.id, { includeDeleted: true }) : null;
+
+    if (!entry || !owned) {
       return ctx.json({ error: "not_found", message: `No delivery queue entry with id "${id}"` }, 404);
     }
 

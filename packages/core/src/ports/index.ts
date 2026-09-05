@@ -687,6 +687,15 @@ export interface WebhookRepository {
   ): Promise<void>;
   /** Look up a single queue entry by id (for replay). */
   findQueueEntry(id: string): Promise<WebhookQueueEntry | null>;
+  /**
+   * Return rows stuck in 'claimed' since before `claimedBefore` to 'pending'.
+   * A worker that dies mid-delivery leaves its claim behind; without this the
+   * row is never due again and the event is silently lost — the exact failure
+   * the durable queue exists to prevent. Returns how many rows were released.
+   */
+  reclaimStale(claimedBefore: number): Promise<number>;
+  /** Rows still awaiting delivery (pending or claimed). Feeds the queue-depth gauge. */
+  countPending(): Promise<number>;
   listDeliveriesByLinkId(linkId: string): Promise<WebhookDelivery[]>;
 }
 

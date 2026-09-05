@@ -303,12 +303,11 @@ export class LinkService {
       deps.health ?? new AnchorHealth({ enabled: false, url: null, homeDomain: null, probeAccount: null });
   }
 
-  /** Webhook deliveries currently in flight (including in-process retries). */
-  /** Pending rows in the durable webhook queue. Since #101 this is a real
-   *  backlog depth rather than a count of in-process HTTP calls, which is what
-   *  the `webhook_deliveries_in_flight` gauge was always meant to mean. */
-  webhookQueueDepth(): number {
-    return this.sender.pendingDepth;
+  /** Undelivered rows in the durable webhook queue. Since the queue landed this
+   *  is a real backlog depth rather than a count of in-process HTTP calls, which
+   *  is what the `webhook_deliveries_in_flight` gauge was always meant to mean. */
+  webhookQueueDepth(): Promise<number> {
+    return this.deps.webhooks.countPending();
   }
 
   /**
@@ -1319,7 +1318,9 @@ export class LinkService {
   ): Promise<void> {
     const hooks = await this.deps.webhooks.listBySeller(link.sellerId);
     if (hooks.length === 0) return;
-    await this.sender.dispatch(hooks, link.id, {
+    // Enqueue and return: event emission must never block a state transition,
+    // and a crash between here and delivery no longer loses the event.
+    await this.sender.enqueue(hooks, link.id, {
       event,
       data: {
         linkId: link.id,
@@ -1331,7 +1332,7 @@ export class LinkService {
         txHash: link.txHash,
         ...extra,
       },
-    }, { logger: opts.logger ?? this.deps.logger! });
+    });
   }
 }
 

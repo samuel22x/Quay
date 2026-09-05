@@ -116,7 +116,7 @@ describe("DrizzleWebhookRepository", () => {
       const hook = await repo.create({ sellerId: SELLER, url: "https://a.example.com", secret: "secret-a-000000" });
 
       for (let i = 0; i < 5; i++) {
-        await repo.recordDelivery({ webhookId: hook.id, linkId: `lnk_${i}`, event: "link.paid", statusCode: 200, ok: true, error: null });
+        await repo.recordDelivery({ webhookId: hook.id, linkId: `lnk_${i}`, event: "link.paid", attempt: 1, queueEntryId: null, statusCode: 200, ok: true, error: null });
         await new Promise((r) => setTimeout(r, 2)); // ensure distinct createdAt ordering
       }
 
@@ -136,7 +136,7 @@ describe("DrizzleWebhookRepository", () => {
     it("remains visible for a deleted webhook", async () => {
       const repo = await freshRepo();
       const hook = await repo.create({ sellerId: SELLER, url: "https://a.example.com", secret: "secret-a-000000" });
-      await repo.recordDelivery({ webhookId: hook.id, linkId: "lnk_1", event: "link.paid", statusCode: 200, ok: true, error: null });
+      await repo.recordDelivery({ webhookId: hook.id, linkId: "lnk_1", event: "link.paid", attempt: 1, queueEntryId: null, statusCode: 200, ok: true, error: null });
       await repo.softDelete(hook.id, SELLER);
 
       const { deliveries } = await repo.listDeliveries(hook.id, SELLER, { limit: 10 });
@@ -146,7 +146,7 @@ describe("DrizzleWebhookRepository", () => {
     it("returns empty results for a webhook not owned by this seller", async () => {
       const repo = await freshRepo();
       const hook = await repo.create({ sellerId: SELLER, url: "https://a.example.com", secret: "secret-a-000000" });
-      await repo.recordDelivery({ webhookId: hook.id, linkId: "lnk_1", event: "link.paid", statusCode: 200, ok: true, error: null });
+      await repo.recordDelivery({ webhookId: hook.id, linkId: "lnk_1", event: "link.paid", attempt: 1, queueEntryId: null, statusCode: 200, ok: true, error: null });
 
       const { deliveries } = await repo.listDeliveries(hook.id, OTHER_SELLER, { limit: 10 });
       expect(deliveries).toHaveLength(0);

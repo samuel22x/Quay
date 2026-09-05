@@ -143,6 +143,24 @@ function makeNoopWebhookRepo(): WebhookRepository {
     async listBySeller() {
       return [];
     },
+    async getById() {
+      return null;
+    },
+    async rotateSecret() {
+      return null;
+    },
+    async softDelete() {
+      return false;
+    },
+    async listDeliveries() {
+      return { deliveries: [], nextCursor: null };
+    },
+    async reclaimStale() {
+      return 0;
+    },
+    async countPending() {
+      return 0;
+    },
     async findWebhookById(): Promise<null> {
       return null;
     },

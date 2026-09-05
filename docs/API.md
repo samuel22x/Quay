@@ -672,7 +672,8 @@ recovering dead-lettered entries or forcing a retry without waiting for the
 next backoff window.
 
 `:id` is the queue entry id returned in delivery metadata, or visible in
-`webhook_queue.id`.
+`webhook_queue.id`. Scoped to the calling seller: an entry belonging to another
+merchant's webhook is reported as **404**, the same as one that does not exist.
 
 **Behaviour by current status**
 
@@ -695,7 +696,7 @@ next backoff window.
   "message": "Queued for immediate redelivery."
 }
 ```
-**404** — queue entry not found.
+**404** — queue entry not found, or not yours.
 **409** — delivery is currently in-flight.
 
 ---
@@ -745,9 +746,12 @@ registered URL.
 
 ### Delivery guarantees
 
-- **Durable**: the event body is serialised and signed once at write time and
-  persisted in `webhook_queue`. A process crash during backoff does not lose the
-  event — it will be delivered after restart.
+- **Durable**: the event body is serialised once at write time and persisted in
+  `webhook_queue`, so every attempt re-sends byte-identical content. A process
+  crash during backoff does not lose the event — it is delivered after restart,
+  and a crash mid-delivery releases its claim so another worker picks it up.
+  Signing happens per attempt, which is what lets a secret rotated between
+  attempts take effect.
 - **At-least-once**: retried up to 5 attempts with exponential backoff + full
   jitter (base 5 s → max ceiling doubles per attempt). Make receivers idempotent.
 - **Per-attempt history**: every attempt is written to `webhook_deliveries`

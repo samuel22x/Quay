@@ -51,7 +51,7 @@ export function metricsRoutes(container: Container): Hono<{ Variables: RequestCo
     ]);
     metrics.accountsWatched.set(accounts.length);
     metrics.pendingCashOuts.set(pendingCashOuts.length);
-    metrics.webhookQueueDepth.set(container.service.webhookQueueDepth());
+    metrics.webhookQueueDepth.set(await container.service.webhookQueueDepth());
     metrics.circuitBreakerState.set(container.circuitBreakerState());
     metrics.watcherLagSeconds.set(container.watcherLagSeconds());
 

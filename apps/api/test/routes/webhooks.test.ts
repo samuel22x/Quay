@@ -126,3 +126,77 @@ describe("GET /webhooks", () => {
     }
   });
 });
+
+describe("POST /webhooks/deliveries/:id/replay", () => {
+  it("re-queues a dead-lettered entry for the seller that owns it", async () => {
+    const seller = await container.sellers.getDefault();
+    const hook = await container.webhooks.create({
+      sellerId: seller.id,
+      url: "https://example.com/replay-me",
+      secret: "replay-secret-000",
+    });
+    const entry = await container.webhooks.enqueue({
+      id: "wqe_replay_1",
+      webhookId: hook.id,
+      linkId: "lnk_1",
+      event: "link.paid",
+      payload: JSON.stringify({ event: "link.paid" }),
+      nextAttemptAt: Date.now(),
+      createdAt: Date.now(),
+    });
+    await container.webhooks.updateQueueEntry(entry.id, {
+      status: "dead",
+      attempts: 5,
+      nextAttemptAt: entry.nextAttemptAt,
+      lastStatusCode: 500,
+      lastError: "HTTP 500",
+    });
+
+    const res = await req(`/webhooks/deliveries/${entry.id}/replay`, { method: "POST" });
+    expect(res.status).toBe(202);
+
+    const after = await container.webhooks.findQueueEntry(entry.id);
+    expect(after?.status).toBe("pending");
+    // The attempt history is preserved — replay resumes the count, not resets it.
+    expect(after?.attempts).toBe(5);
+  });
+
+  it("does not let one seller replay another seller's delivery", async () => {
+    const other = await container.sellers.createIfAbsent(
+      "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+    );
+    const theirHook = await container.webhooks.create({
+      sellerId: other.id,
+      url: "https://example.com/not-yours",
+      secret: "their-secret-0000",
+    });
+    const theirEntry = await container.webhooks.enqueue({
+      id: "wqe_replay_2",
+      webhookId: theirHook.id,
+      linkId: "lnk_2",
+      event: "link.paid",
+      payload: JSON.stringify({ event: "link.paid" }),
+      nextAttemptAt: Date.now(),
+      createdAt: Date.now(),
+    });
+    await container.webhooks.updateQueueEntry(theirEntry.id, {
+      status: "dead",
+      attempts: 5,
+      nextAttemptAt: theirEntry.nextAttemptAt,
+      lastStatusCode: 500,
+      lastError: "HTTP 500",
+    });
+
+    // Authenticated as the default seller, replaying someone else's entry.
+    const res = await req(`/webhooks/deliveries/${theirEntry.id}/replay`, { method: "POST" });
+    expect(res.status).toBe(404);
+
+    const after = await container.webhooks.findQueueEntry(theirEntry.id);
+    expect(after?.status).toBe("dead"); // untouched
+  });
+
+  it("returns 404 for an unknown entry", async () => {
+    const res = await req("/webhooks/deliveries/wqe_nope/replay", { method: "POST" });
+    expect(res.status).toBe(404);
+  });
+});
